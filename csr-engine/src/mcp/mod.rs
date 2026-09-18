@@ -1,5 +1,6 @@
 pub mod completions;
 pub mod elicitation;
+pub mod http;
 pub mod resources;
 pub mod scope;
 pub mod tasks;

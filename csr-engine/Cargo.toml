@@ -6,7 +6,14 @@ description = "Claude Self-Reflect: Rust MCP server with embedded vector search"
 
 [dependencies]
 # ~1.6: rmcp 1.7 moved Content/RawResource and made structs non-exhaustive — migration deferred (see #203)
-rmcp = { version = "~1.6", features = ["server", "transport-io", "macros", "elicitation"] }
+rmcp = { version = "~1.6", features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+    "macros",
+    "elicitation",
+] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 fastembed = "5.9"
 hnsw_rs = "0.3"
 rusqlite = { version = "0.40", features = ["bundled", "vtab"] }
