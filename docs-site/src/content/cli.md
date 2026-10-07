@@ -15,8 +15,7 @@ http://127.0.0.1:7391/mcp -s user` in place of the stdio entry.
 ```bash
 csr-engine --serve-http 127.0.0.1:7391
 ```
-Loopback only unless `CSR_SERVE_HTTP_ALLOW_NON_LOOPBACK=1` is set: the endpoint
-is unauthenticated.
+Loopback addresses only: the endpoint is unauthenticated.
 
 ### setup
 One-shot: import + MCP registration + hook installation.
@@ -84,7 +83,6 @@ csr-engine quality src/main.rs
 | CSR_NARRATIVE_MODEL | (none) | Override AI narrative model (chain: this → `haiku` → CLI default) |
 | CSR_NO_AI_NARRATIVES | (none) | Set to `1` to disable AI narratives |
 | CSR_DB_PATH | ~/.claude-self-reflect/csr-engine.db | DB location |
-| CSR_SERVE_HTTP_ALLOW_NON_LOOPBACK | (none) | Set to `1` to let `--serve-http` bind a non-loopback address |
 
 ## Data Locations
 
