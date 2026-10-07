@@ -195,7 +195,7 @@ Which writes the `http` server entry that replaces the stdio one:
 }
 ```
 
-Prefer HTTP when several sessions run at once. Keep stdio for a single session: nothing has to be started in advance, and one process is simpler. The server has to be running before Claude Code connects, and the endpoint is unauthenticated, so it binds loopback addresses only. Set `CSR_SERVE_HTTP_ALLOW_NON_LOOPBACK=1` to override that, and put your own authentication in front of it if you do. The 6 hooks are unaffected: they run as their own short-lived processes on either transport.
+Prefer HTTP when several sessions run at once. Keep stdio for a single session: nothing has to be started in advance, and one process is simpler. The server has to be running before Claude Code connects, and the endpoint is unauthenticated, so it binds loopback addresses only. The 6 hooks are unaffected: they run as their own short-lived processes on either transport.
 
 </details>
 

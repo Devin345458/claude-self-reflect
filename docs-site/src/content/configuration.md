@@ -33,7 +33,7 @@ The entry that replaces the stdio one:
 ```
 Worth it when several sessions run at once. The server must already be running
 when Claude Code connects, and the endpoint is unauthenticated, so it binds
-loopback addresses only unless `CSR_SERVE_HTTP_ALLOW_NON_LOOPBACK=1` is set.
+loopback addresses only.
 
 ## Hooks
 

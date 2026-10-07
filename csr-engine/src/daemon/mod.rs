@@ -508,8 +508,9 @@ impl Daemon {
         let _ = ancestry_handle.await;
         watcher_handle.abort(); // Watcher uses notify which doesn't check shutdown flag
         if let Some(handle) = mcp_http_handle {
-            // The HTTP server parks on accept() and never observes the
-            // shutdown flag; stop taking requests before the index is flushed.
+            // The HTTP server stops itself on Ctrl+C but never observes the
+            // shutdown flag. Make sure it has stopped taking requests before
+            // the index is flushed.
             handle.abort();
         }
 

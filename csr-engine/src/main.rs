@@ -36,7 +36,7 @@ struct Args {
 
     /// Serve MCP over Streamable HTTP on this address instead of stdio, e.g.
     /// 127.0.0.1:7391. One process, one index load, many Claude Code sessions.
-    /// Loopback only unless CSR_SERVE_HTTP_ALLOW_NON_LOOPBACK=1.
+    /// Loopback addresses only: the endpoint is unauthenticated.
     #[arg(long, value_name = "ADDR")]
     serve_http: Option<String>,
 
@@ -106,7 +106,7 @@ enum Commands {
 
         /// Also host the MCP endpoint over Streamable HTTP on this address,
         /// e.g. 127.0.0.1:7391, sharing the index the daemon already holds.
-        /// Loopback only unless CSR_SERVE_HTTP_ALLOW_NON_LOOPBACK=1.
+        /// Loopback addresses only: the endpoint is unauthenticated.
         #[arg(long, value_name = "ADDR")]
         serve_http: Option<String>,
     },
