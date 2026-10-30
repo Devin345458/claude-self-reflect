@@ -331,6 +331,21 @@ impl ClaimedStdout {
     }
 }
 
+/// Whether a hook can run on an import-only engine that skips loading and
+/// persisting the HNSW index (see [`crate::engine::Engine::new_import_only`]).
+///
+/// `precompact` and `session-end` only import a transcript (and, for
+/// session-end, write reflections to SQLite). Neither queries the HNSW, so
+/// skipping the load is safe and the new rows are reconciled by the additive
+/// backfill in `Engine::new` on the next search-time load.
+///
+/// Everything else stays on the full engine. `session-start` and
+/// `prompt-submit` query the index. `stop` and `post-tool-use` are left out
+/// to keep the scope matched to upstream PR #304.
+pub fn is_import_only_hook(hook_name: &str) -> bool {
+    matches!(hook_name, "precompact" | "session-end")
+}
+
 /// Main hook dispatcher. Parses stdin, routes to handler.
 /// Whether a hook is allowed to persist HNSW changes to the on-disk cache
 /// after it runs. Persistence used to be an unconditional side effect of
@@ -650,6 +665,21 @@ mod tests {
             closed.into_inner().is_empty(),
             "a successful diversion must not close the saved descriptor"
         );
+    }
+
+    #[test]
+    fn only_write_only_hooks_skip_the_index() {
+        // Write-only importers may run on the import-only engine.
+        assert!(is_import_only_hook("precompact"));
+        assert!(is_import_only_hook("session-end"));
+        // session-start and prompt-submit query the index and must keep it
+        // loaded, or they search an empty index and silently return nothing.
+        for full in ["stop", "session-start", "prompt-submit", "post-tool-use"] {
+            assert!(
+                !is_import_only_hook(full),
+                "{full} must not be treated as import-only"
+            );
+        }
     }
 
     #[test]
