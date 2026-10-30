@@ -23,10 +23,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `claude mcp add --transport http claude-self-reflect http://127.0.0.1:7391/mcp -s user`.
   Prefer it when many sessions run at once; stdio stays the default and
   remains simpler for a single session.
-- `initialize` now agrees to protocol revisions up to 2025-11-25 only. rmcp
-  3.1 accepts 2026-07-28 but never emits the `ttlMs`/`cacheScope` metadata
-  that revision requires on list results, so a Claude Code client that
-  negotiated it (as it does over HTTP) connected with 0 tools.
 
 ## [9.5.8] - 2026-09-21
 
