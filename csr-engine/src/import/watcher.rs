@@ -18,6 +18,22 @@ const DEBOUNCE_SECS: u64 = 5;
 /// Batch size for embedding during auto-import.
 const BATCH_SIZE: usize = 10;
 
+/// Minimum time between the watcher's full index dumps. Each one rewrites the
+/// whole chunk side (1.7 GB on a real install) under the exclusive index lock;
+/// dumping after every 5 s debounce batch wrote it about four times a minute,
+/// and hooks starved waiting for the lock. Rows imported in between are in
+/// SQLite, and every process that loads the index backfills them.
+const FULL_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Whether the watcher's periodic full dump is due.
+fn full_flush_due(
+    last_full_flush: std::time::Instant,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    now.saturating_duration_since(last_full_flush) >= interval
+}
+
 /// Watches the Claude projects directory for new JSONL files and auto-imports them.
 pub struct FileWatcher {
     projects_dir: PathBuf,
@@ -78,6 +94,10 @@ impl FileWatcher {
         watcher.watch(&self.projects_dir, RecursiveMode::Recursive)?;
         tracing::info!(dir = %self.projects_dir.display(), "file watcher started");
 
+        // The clock starts now: the first full dump comes one interval after the
+        // watcher starts (the daemon's shutdown flush covers a short run).
+        let mut last_full_flush = std::time::Instant::now();
+
         // Debounce loop: collect changed files over DEBOUNCE_SECS, then process
         loop {
             let mut pending: HashSet<PathBuf> = HashSet::new();
@@ -126,7 +146,16 @@ impl FileWatcher {
                     }
                 }
 
-                // Flush HNSW index to disk after processing batch
+                // Flush HNSW index to disk, at most once per FULL_FLUSH_INTERVAL.
+                // A batch after a quiet spell flushes as soon as it lands.
+                if !full_flush_due(
+                    last_full_flush,
+                    std::time::Instant::now(),
+                    FULL_FLUSH_INTERVAL,
+                ) {
+                    continue;
+                }
+                last_full_flush = std::time::Instant::now();
                 let mut idx = self.search.write().await;
                 if idx.is_dirty() {
                     let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
@@ -320,6 +349,20 @@ fn needs_reindex(parsed: &ConversationChunk, stored: Option<&ConversationChunk>)
 mod tests {
     use super::*;
     use crate::provenance::Speaker;
+
+    #[test]
+    fn full_flush_waits_for_the_interval() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(600);
+        assert!(!full_flush_due(t0, t0, interval));
+        assert!(!full_flush_due(t0, t0 + Duration::from_secs(599), interval));
+        assert!(full_flush_due(t0, t0 + interval, interval));
+        assert!(
+            !full_flush_due(t0 + Duration::from_secs(5), t0, interval),
+            "a last-flush time after `now` never counts as due"
+        );
+    }
 
     fn chunk(id: &str, content: &str) -> ConversationChunk {
         ConversationChunk {

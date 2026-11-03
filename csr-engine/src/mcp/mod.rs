@@ -238,13 +238,22 @@ impl CsrServer {
         Self::tool_router().list_all().len()
     }
 
-    /// Flush the HNSW index to disk if dirty.
+    /// Persist the reflection `store_reflection` just added. Reflections only:
+    /// this server usually runs inside the daemon, whose chunk side is dirty
+    /// from watcher imports, and a full dump here rewrote the 1.7 GB chunk
+    /// index on every stored reflection. The daemon's watcher persists the
+    /// chunk side on its own timer.
     async fn flush_index(&self) {
         let mut idx = self.search.write().await;
-        if idx.is_dirty() {
+        if idx.is_reflection_dirty() {
             let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
             let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
-            if let Err(e) = idx.dump_to_disk(&self.index_dir, chunk_count, refl_count) {
+            if let Err(e) = idx.dump_to_disk_scoped(
+                &self.index_dir,
+                chunk_count,
+                refl_count,
+                crate::search::DumpScope::ReflectionsOnly,
+            ) {
                 tracing::warn!(error = %e, "failed to flush HNSW index after store_reflection");
             }
         }

@@ -514,7 +514,10 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     // Nothing after the handler should reach stdout; see suppress_stdout.
     suppress_stdout();
     if hook_may_persist_index(hook_name) {
-        engine.flush_index().await;
+        // Reflections only: the chunk side is 1.7 GB on a real install, and a
+        // full flush here rewrote it after nearly every response. New chunks
+        // are already in SQLite; the daemon persists the chunk side on a timer.
+        engine.flush_index_reflections_only().await;
     }
     let t_total = t0.elapsed();
 

@@ -535,7 +535,27 @@ impl Engine {
     pub async fn rebuild_search_index(
         &self,
         cancel: Option<Arc<AtomicBool>>,
+        scope: CompactionScope,
     ) -> Result<Option<RebuildReport>> {
+        if scope == CompactionScope::ReflectionsOnly {
+            // A reflection-only compaction keeps this engine's chunk side and
+            // publishes the chunk side already on disk. That is only sound when
+            // both descend from the same compaction; if another process
+            // compacted since this engine loaded, rebuild everything instead.
+            let index_dir = self.index_dir.clone();
+            let disk_epoch = tokio::task::spawn_blocking(move || {
+                crate::search::on_disk_compaction_epoch(&index_dir)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("manifest epoch probe failed: {e}"))?;
+            if disk_epoch <= self.search.read().await.compaction_epoch() {
+                return self.rebuild_reflection_side(cancel).await;
+            }
+            tracing::warn!(
+                disk_epoch,
+                "reflection-only compaction escalated to a full rebuild: a newer compaction is on disk"
+            );
+        }
         let t_build = std::time::Instant::now();
         let storage = self.storage.clone();
         let cancel_build = cancel.clone();
@@ -611,6 +631,95 @@ impl Engine {
             build,
             publish,
             epoch,
+            scope: CompactionScope::Full,
+        }))
+    }
+
+    /// Rebuild only the reflection index from SQLite and swap it into this
+    /// engine, leaving the chunk index exactly as it is. Reflections churn
+    /// (every `stop` hook replaces its session's episode), so they reach the
+    /// tombstone threshold long before chunks do, and rebuilding 13k reflection
+    /// vectors takes seconds where the chunk side takes hours at the daemon's
+    /// background priority. The publish writes the reflection side and carries
+    /// the published chunk side forward.
+    async fn rebuild_reflection_side(
+        &self,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<RebuildReport>> {
+        let t_build = std::time::Instant::now();
+        let storage = self.storage.clone();
+        let cancel_build = cancel.clone();
+        let built = tokio::task::spawn_blocking(move || {
+            let Some((mut fresh, reflections)) = rebuild_reflections_streaming_cancellable(
+                &storage,
+                RECONCILE_BATCH,
+                cancel_build.as_deref(),
+            )?
+            else {
+                return Ok::<_, anyhow::Error>(None);
+            };
+            reconcile_search_with_db(
+                &storage,
+                &mut fresh,
+                storage.load_all_reflection_ids().ok().as_deref(),
+                None,
+            );
+            Ok(Some((fresh, reflections)))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("reflection rebuild task failed: {e}"))??;
+        let Some((fresh, reflections)) = built else {
+            return Ok(None);
+        };
+        if is_cancelled(cancel.as_deref()) {
+            return Ok(None);
+        }
+        let build = t_build.elapsed();
+
+        let storage = self.storage.clone();
+        let reflection_ids = tokio::task::spawn_blocking(move || storage.load_all_reflection_ids())
+            .await
+            .map_err(|e| anyhow::anyhow!("reflection id probe task failed: {e}"))?;
+        let t_publish = std::time::Instant::now();
+        let epoch = {
+            let mut live = self.search.write().await;
+            live.replace_reflection_side(fresh);
+            reconcile_search_with_db(
+                &self.storage,
+                &mut live,
+                reflection_ids.ok().as_deref(),
+                None,
+            );
+            if !self.skip_index_persistence {
+                live.mark_as_compaction();
+                let published = self.storage.count_chunk_embeddings().and_then(|chunks| {
+                    let refls = self.storage.count_reflection_embeddings()?;
+                    live.dump_to_disk_scoped(
+                        &self.index_dir,
+                        chunks,
+                        refls,
+                        crate::search::DumpScope::ReflectionsOnly,
+                    )
+                });
+                if let Err(e) = published {
+                    live.cancel_compaction_publish();
+                    return Err(e.context(format!(
+                        "persisting HNSW index to {}",
+                        self.index_dir.display()
+                    )));
+                }
+            }
+            live.compaction_epoch()
+        };
+        let publish = t_publish.elapsed();
+        crate::search::clear_needs_compaction(&self.index_dir);
+        Ok(Some(RebuildReport {
+            chunks: 0,
+            reflections,
+            build,
+            publish,
+            epoch,
+            scope: CompactionScope::ReflectionsOnly,
         }))
     }
 
@@ -624,15 +733,34 @@ impl Engine {
         // accept it as current and (via the id-backfill in `Engine::new`)
         // recover only by re-inserting the whole corpus — the expensive rebuild
         // this path exists to avoid. See `skip_index_persistence`.
+        self.flush_index_scoped(crate::search::DumpScope::Full)
+            .await;
+    }
+
+    /// Persist only the reflection side, carrying the published chunk side
+    /// forward. Used by the `stop` hook: a full flush there rewrote the whole
+    /// 1.7 GB chunk index after nearly every response. Its new chunks are in
+    /// SQLite already; the daemon persists the chunk side on a timer.
+    pub async fn flush_index_reflections_only(&self) {
+        self.flush_index_scoped(crate::search::DumpScope::ReflectionsOnly)
+            .await;
+    }
+
+    async fn flush_index_scoped(&self, scope: crate::search::DumpScope) {
         if self.skip_index_persistence {
             return;
         }
         let mut idx = self.search.write().await;
-        if idx.is_dirty() {
+        let due = match scope {
+            crate::search::DumpScope::Full => idx.is_dirty(),
+            crate::search::DumpScope::ReflectionsOnly => idx.is_reflection_dirty(),
+        };
+        if due {
             // Query current DB counts for staleness-correct manifest
             let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
             let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
-            if let Err(e) = idx.dump_to_disk(&self.index_dir, chunk_count, refl_count) {
+            if let Err(e) = idx.dump_to_disk_scoped(&self.index_dir, chunk_count, refl_count, scope)
+            {
                 tracing::warn!(error = %e, "failed to flush HNSW index (non-fatal)");
             }
         }
@@ -947,6 +1075,43 @@ pub struct RebuildReport {
     pub publish: std::time::Duration,
     /// The compaction epoch the new manifest carries.
     pub epoch: u64,
+    /// Which sides were rebuilt. `chunks` is 0 for a reflection-only rebuild.
+    pub scope: CompactionScope,
+}
+
+/// Which sides of the index a compaction rebuilds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionScope {
+    /// Both sides, from the whole of SQLite.
+    Full,
+    /// The reflection side only; the chunk side is kept as it is.
+    ReflectionsOnly,
+}
+
+/// Rebuild only the reflection side from SQLite, in bounded batches, checking
+/// `cancel` before each one. The returned engine's chunk side is empty and
+/// unused: callers transplant its reflection side with
+/// [`SearchEngine::replace_reflection_side`].
+fn rebuild_reflections_streaming_cancellable(
+    storage: &Storage,
+    batch_size: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<(SearchEngine, usize)>> {
+    let reflection_ids = storage.load_all_reflection_ids()?;
+    // SearchEngine::new sizes the reflection index at a tenth of its argument.
+    let mut search = SearchEngine::new(((reflection_ids.len() + 1000) * 10).max(10_000));
+    let mut total = 0usize;
+    for batch in reflection_ids.chunks(batch_size.max(1)) {
+        if is_cancelled(cancel) {
+            return Ok(None);
+        }
+        let vecs = storage.get_reflection_vectors_by_ids(batch)?;
+        total += vecs.len();
+        for (id, vec) in vecs {
+            search.insert_reflection(id, vec);
+        }
+    }
+    Ok(Some((search, total)))
 }
 
 #[cfg(test)]
@@ -1254,7 +1419,7 @@ mod tests {
 
         let report = c
             .engine()
-            .rebuild_search_index(None)
+            .rebuild_search_index(None, CompactionScope::Full)
             .await
             .unwrap()
             .expect("an uncancelled rebuild completes");
@@ -1293,7 +1458,7 @@ mod tests {
 
         let cancel = Arc::new(AtomicBool::new(true));
         assert!(eng
-            .rebuild_search_index(Some(cancel))
+            .rebuild_search_index(Some(cancel), CompactionScope::Full)
             .await
             .unwrap()
             .is_none());
@@ -1318,7 +1483,11 @@ mod tests {
         let eng = c.engine();
         // Lands in SQLite after the engine loaded; a rebuild must pick it up.
         c.seed("conv-late", "late", 3);
-        let report = eng.rebuild_search_index(None).await.unwrap().unwrap();
+        let report = eng
+            .rebuild_search_index(None, CompactionScope::Full)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(report.chunks, 13);
         let live = eng.search.read().await;
         for i in 0..3 {
@@ -1371,5 +1540,139 @@ mod tests {
                 .chunk_blank,
             0
         );
+    }
+    fn seed_reflections(c: &Corpus, prefix: &str, n: usize) {
+        let storage = Storage::open(&c.db_path).unwrap();
+        for i in 0..n {
+            storage
+                .insert_reflection(&format!("{prefix}-{i}"), "content", &[], &[0.2_f32; 384])
+                .unwrap();
+        }
+    }
+
+    fn manifest_json(c: &Corpus) -> serde_json::Value {
+        serde_json::from_slice(&c.manifest_bytes()).unwrap()
+    }
+
+    fn chunk_file_stamp(c: &Corpus) -> (std::time::SystemTime, u64) {
+        let basename = manifest_json(c)["chunk_basename"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let meta = std::fs::metadata(c.index_dir.join(format!("{basename}.hnsw.data"))).unwrap();
+        (meta.modified().unwrap(), meta.len())
+    }
+
+    /// The `stop` hook saves reflections only: its new chunks are in SQLite,
+    /// and rewriting the whole chunk index after every response was most of
+    /// the disk traffic. The daemon's periodic full save picks the chunks up.
+    #[tokio::test]
+    async fn stop_hook_flush_writes_reflections_and_leaves_the_chunk_index_alone() {
+        let c = Corpus::new();
+        c.seed("conv-keep", "keep", 10);
+        seed_reflections(&c, "refl", 2);
+        drop(c.engine());
+        let before = manifest_json(&c);
+        let stamp = chunk_file_stamp(&c);
+
+        c.seed("conv-late", "late", 3);
+        seed_reflections(&c, "late-refl", 1);
+        let hook = c.engine(); // backfills both: chunk and reflection sides dirty
+        hook.flush_index_reflections_only().await;
+
+        let after = manifest_json(&c);
+        assert_eq!(after["chunk_basename"], before["chunk_basename"]);
+        assert_eq!(after["chunk_id_map"], before["chunk_id_map"]);
+        assert_eq!(
+            chunk_file_stamp(&c),
+            stamp,
+            "the chunk index file must not be rewritten"
+        );
+        let reflections: Vec<String> =
+            serde_json::from_value(after["reflection_id_map"].clone()).unwrap();
+        assert!(reflections.contains(&"late-refl-0".to_string()));
+
+        // A full flush (the daemon's periodic save) writes the chunk side.
+        hook.flush_index().await;
+        assert_eq!(
+            crate::search::on_disk_tombstones(&c.index_dir)
+                .unwrap()
+                .chunk_slots,
+            13
+        );
+    }
+
+    /// Reflections churn and reach the threshold long before chunks do. A
+    /// compaction triggered by them rebuilds the reflection side only and
+    /// leaves the (large) chunk index files untouched.
+    #[tokio::test]
+    async fn reflection_churn_compacts_only_the_reflection_side() {
+        use crate::daemon::{compaction_tick, CompactionOutcome};
+        let c = Corpus::new();
+        c.seed("conv-keep", "keep", 10);
+        seed_reflections(&c, "refl", 40);
+        let eng = c.engine(); // cache miss: publishes epoch 1
+        let before = manifest_json(&c);
+        let stamp = chunk_file_stamp(&c);
+
+        {
+            let storage = Storage::open(&c.db_path).unwrap();
+            for i in 0..30 {
+                storage.delete_reflection(&format!("refl-{i}")).unwrap();
+            }
+        }
+        let hook = c.engine(); // 30 of 40 reflection slots blank: marks
+        assert!(crate::search::needs_compaction(&c.index_dir));
+        hook.flush_index_reflections_only().await; // publishes the blanks, as stop does
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        match compaction_tick(&eng, &shutdown).await {
+            CompactionOutcome::Rebuilt(report) => {
+                assert_eq!(report.scope, CompactionScope::ReflectionsOnly);
+                assert_eq!(report.reflections, 10);
+                assert_eq!(report.chunks, 0);
+            }
+            other => panic!("expected a reflection-only rebuild, got {other:?}"),
+        }
+
+        let after = manifest_json(&c);
+        assert_eq!(
+            after["chunk_basename"], before["chunk_basename"],
+            "a reflection-only compaction must not write a chunk generation"
+        );
+        assert_eq!(chunk_file_stamp(&c), stamp);
+        let t = crate::search::on_disk_tombstones(&c.index_dir).unwrap();
+        assert_eq!((t.reflection_blank, t.reflection_slots), (0, 10));
+        assert_eq!((t.chunk_blank, t.chunk_slots), (0, 10));
+        assert_eq!(after["compaction_epoch"], 2);
+        assert!(!crate::search::needs_compaction(&c.index_dir));
+
+        let live = eng.search.read().await;
+        assert_eq!(live.reflection_count(), 10);
+        assert_eq!(live.live_chunk_count(), 10);
+        assert!(!live.has_reflection("refl-0"));
+        assert!(live.has_reflection("refl-39"));
+    }
+
+    /// A reflection-only compaction keeps this engine's chunk side, which is
+    /// only sound if no other process compacted since this engine loaded.
+    #[tokio::test]
+    async fn reflection_only_compaction_escalates_when_a_newer_compaction_is_on_disk() {
+        let c = Corpus::new();
+        c.seed("conv-keep", "keep", 10);
+        seed_reflections(&c, "refl", 4);
+        let eng = c.engine(); // epoch 1
+        c.engine()
+            .rebuild_search_index(None, CompactionScope::Full)
+            .await
+            .unwrap()
+            .unwrap(); // epoch 2, by another process
+        let report = eng
+            .rebuild_search_index(None, CompactionScope::ReflectionsOnly)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.scope, CompactionScope::Full);
+        assert_eq!(report.epoch, 3);
     }
 }

@@ -493,14 +493,29 @@ pub async fn compaction_tick(
         ));
         return CompactionOutcome::StaleMarkerCleared(counts);
     }
+    // Rebuild only what is over the threshold. Reflections churn far faster
+    // than chunks, and the chunk side is the expensive one.
+    let scope = if counts.chunks_material() {
+        crate::engine::CompactionScope::Full
+    } else {
+        crate::engine::CompactionScope::ReflectionsOnly
+    };
     crate::telemetry::append_timing_line(&format!(
-        "CSR compaction: started (chunk tombstones {}/{}, reflection tombstones {}/{})",
-        counts.chunk_blank, counts.chunk_slots, counts.reflection_blank, counts.reflection_slots,
+        "CSR compaction: started scope={:?} (chunk tombstones {}/{}, reflection tombstones {}/{})",
+        scope,
+        counts.chunk_blank,
+        counts.chunk_slots,
+        counts.reflection_blank,
+        counts.reflection_slots,
     ));
-    match engine.rebuild_search_index(Some(shutdown.clone())).await {
+    match engine
+        .rebuild_search_index(Some(shutdown.clone()), scope)
+        .await
+    {
         Ok(Some(report)) => {
             crate::telemetry::append_timing_line(&format!(
-                "CSR compaction: done chunks={} reflections={} build={}ms publish={}ms epoch={}",
+                "CSR compaction: done scope={:?} chunks={} reflections={} build={}ms publish={}ms epoch={}",
+                report.scope,
                 report.chunks,
                 report.reflections,
                 report.build.as_millis(),

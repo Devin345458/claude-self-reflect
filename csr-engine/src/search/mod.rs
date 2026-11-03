@@ -156,6 +156,14 @@ pub fn on_disk_compaction_epoch(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Which sides of the index a dump may rewrite. See
+/// [`SearchEngine::dump_to_disk_scoped`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DumpScope {
+    Full,
+    ReflectionsOnly,
+}
+
 /// Blank (tombstoned) and total id-map slots per side of an index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TombstoneCounts {
@@ -168,8 +176,17 @@ pub struct TombstoneCounts {
 impl TombstoneCounts {
     /// Whether either side is materially tombstoned (see `ORPHAN_REBUILD_DIVISOR`).
     pub fn material(&self) -> bool {
+        self.chunks_material() || self.reflections_material()
+    }
+
+    /// Whether the chunk side alone is materially tombstoned.
+    pub fn chunks_material(&self) -> bool {
         tombstones_material_share(self.chunk_blank, self.chunk_slots)
-            || tombstones_material_share(self.reflection_blank, self.reflection_slots)
+    }
+
+    /// Whether the reflection side alone is materially tombstoned.
+    pub fn reflections_material(&self) -> bool {
+        tombstones_material_share(self.reflection_blank, self.reflection_slots)
     }
 }
 
@@ -275,9 +292,26 @@ impl SearchEngine {
         self.publishes_compaction = true;
     }
 
+    /// Withdraw a [`Self::mark_as_compaction`] whose publish failed, so a later
+    /// ordinary dump does not advance the epoch.
+    pub fn cancel_compaction_publish(&mut self) {
+        self.publishes_compaction = false;
+    }
+
     /// The compaction epoch this engine's maps descend from.
     pub fn compaction_epoch(&self) -> u64 {
         self.compaction_epoch
+    }
+
+    /// Replace this engine's reflection side with `rebuilt`'s (a reflection-only
+    /// compaction). The chunk side is left exactly as it is. The reflection side
+    /// is marked dirty so the next dump writes it.
+    pub fn replace_reflection_side(&mut self, rebuilt: SearchEngine) {
+        self.reflection_index = rebuilt.reflection_index;
+        self.reflection_id_map = rebuilt.reflection_id_map;
+        self.reflection_id_set = rebuilt.reflection_id_set;
+        self.active_reflection_count = rebuilt.active_reflection_count;
+        self.reflection_dirty = true;
     }
 
     /// Blank and total id-map slots per side of this in-memory index.
@@ -701,6 +735,27 @@ impl SearchEngine {
         db_chunk_count: usize,
         db_reflection_count: usize,
     ) -> Result<()> {
+        self.dump_to_disk_scoped(dir, db_chunk_count, db_reflection_count, DumpScope::Full)
+    }
+
+    /// [`Self::dump_to_disk`] with a choice of which side may be rewritten.
+    ///
+    /// `DumpScope::ReflectionsOnly` writes the (small) reflection side and
+    /// carries the published chunk side forward unchanged, even when this
+    /// engine's chunk side is dirty. Every new chunk is already in SQLite, so
+    /// the next process to load the index backfills it; only the designated
+    /// periodic writer (the daemon) rewrites the 1.7 GB chunk side. The chunk
+    /// dirty flag stays set, because memory still differs from disk.
+    ///
+    /// Carrying forward is only sound for a manifest-backed engine with a
+    /// readable manifest on disk; otherwise this falls back to a full dump.
+    pub fn dump_to_disk_scoped(
+        &mut self,
+        dir: &Path,
+        db_chunk_count: usize,
+        db_reflection_count: usize,
+        scope: DumpScope,
+    ) -> Result<()> {
         std::fs::create_dir_all(dir)?;
 
         // Advisory lock prevents concurrent dump/load from separate processes (H-2)
@@ -786,8 +841,10 @@ impl SearchEngine {
         // just wrote takes its fresh basename, a side we skipped keeps whatever
         // generation the previous manifest referenced so `cleanup_stale_index_files`
         // still sees it as referenced.
-        let chunk_actually_dumped =
-            (self.chunk_dirty || force_full) && !self.chunk_id_map.is_empty();
+        let chunk_write_allowed = scope == DumpScope::Full || force_full || !self.manifest_backed;
+        let chunk_actually_dumped = chunk_write_allowed
+            && (self.chunk_dirty || force_full)
+            && !self.chunk_id_map.is_empty();
         let chunk_basename = if chunk_actually_dumped {
             dump_hnsw_generation(&self.chunk_index, dir, "chunks")
                 .map_err(|e| anyhow::anyhow!("chunk index dump failed: {}", e))?
@@ -880,7 +937,9 @@ impl SearchEngine {
         cleanup_stale_index_files(dir);
 
         // Lock is released when lock_file is dropped
-        self.chunk_dirty = false;
+        if chunk_write_allowed {
+            self.chunk_dirty = false;
+        }
         self.reflection_dirty = false;
         // The manifest we just published (`std::fs::rename` above already
         // succeeded — this line only runs on that success path, never on an
@@ -1928,6 +1987,74 @@ mod tests {
         current.dump_to_disk(dir, 4, 0).unwrap();
         assert_eq!(on_disk_compaction_epoch(dir), 2);
         assert_eq!(on_disk_tombstones(dir).unwrap().chunk_slots, 4);
+    }
+
+    #[test]
+    fn reflections_only_dump_carries_the_chunk_side_forward() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut seed = SearchEngine::new(10);
+        for i in 0..5 {
+            seed.insert_chunk(format!("c{i}"), vec![i as f32 / 10.0 + 0.05; 384]);
+        }
+        seed.insert_reflection("r0".into(), vec![0.5; 384]);
+        seed.dump_to_disk(dir, 5, 1).unwrap();
+        let read = || -> IndexManifest {
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap()
+        };
+        let before = read();
+        let chunk_data = dir.join(format!("{}.hnsw.data", before.chunk_basename));
+        let stamp = |m: std::fs::Metadata| (test_file_identity(&m), m.modified().unwrap());
+        let chunk_stamp = stamp(std::fs::metadata(&chunk_data).unwrap());
+
+        let mut loaded = SearchEngine::load_from_disk(dir, 5, 1).unwrap();
+        loaded.insert_chunk("c-new".into(), vec![0.9; 384]);
+        loaded.insert_reflection("r-new".into(), vec![0.2; 384]);
+        loaded
+            .dump_to_disk_scoped(dir, 6, 2, DumpScope::ReflectionsOnly)
+            .unwrap();
+
+        let after = read();
+        assert_eq!(after.chunk_basename, before.chunk_basename);
+        assert_eq!(after.chunk_id_map, before.chunk_id_map);
+        assert_eq!(
+            after.chunk_embeddings_expected,
+            before.chunk_embeddings_expected
+        );
+        assert_eq!(
+            stamp(std::fs::metadata(&chunk_data).unwrap()),
+            chunk_stamp,
+            "the chunk generation file must be left untouched"
+        );
+        assert_ne!(after.reflection_basename, before.reflection_basename);
+        assert!(after.reflection_id_map.contains(&"r-new".to_string()));
+        assert!(loaded.is_chunk_dirty(), "memory still differs from disk");
+        assert!(!loaded.is_reflection_dirty());
+
+        // The published pair still loads, and a later full dump writes the chunk side.
+        assert!(SearchEngine::load_from_disk(dir, 6, 2).is_some());
+        loaded.dump_to_disk(dir, 6, 2).unwrap();
+        let full = read();
+        assert!(full.chunk_id_map.contains(&"c-new".to_string()));
+        assert_ne!(full.chunk_basename, before.chunk_basename);
+    }
+
+    #[test]
+    fn reflections_only_dump_from_an_unpublished_engine_writes_both_sides() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut fresh = SearchEngine::new(10);
+        fresh.insert_chunk("c0".into(), vec![0.5; 384]);
+        fresh.insert_reflection("r0".into(), vec![0.25; 384]);
+        fresh
+            .dump_to_disk_scoped(dir, 1, 1, DumpScope::ReflectionsOnly)
+            .unwrap();
+        let loaded = SearchEngine::load_from_disk(dir, 1, 1).unwrap();
+        assert!(
+            loaded.has_chunk("c0"),
+            "with nothing trustworthy to carry forward, the chunk side is written from memory"
+        );
+        assert!(loaded.has_reflection("r0"));
     }
 
     #[test]

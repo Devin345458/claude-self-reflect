@@ -281,7 +281,9 @@ async fn run() -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
-        match eng.rebuild_search_index(None).await? {
+        match eng
+            .rebuild_search_index(None, engine::CompactionScope::Full)
+            .await? {
             Some(r) => println!(
                 "rebuilt index: {} chunks, {} reflections (build {} ms, publish {} ms, compaction epoch {})",
                 r.chunks,
