@@ -110,6 +110,12 @@ enum Commands {
         #[arg(long, value_name = "ADDR")]
         serve_http: Option<String>,
     },
+    /// Rebuild the whole HNSW index from SQLite now, in the foreground, and
+    /// publish it as a new compaction. The daemon does this on its own when
+    /// the index is materially tombstoned. Stop the daemon first: a running
+    /// daemon skips its own index saves until restart after a compaction it
+    /// did not perform (its imports still reach the index via `stop` hooks).
+    RebuildIndex,
     /// Analyze code quality using AST patterns
     Quality {
         /// File path to analyze
@@ -268,6 +274,25 @@ async fn run() -> Result<()> {
 
     if let Some(Commands::Telemetry { since, json, tui }) = args.command {
         return csr_engine::telemetry::handle(&args.db_path, &args.projects_dir, since, json, tui);
+    }
+
+    if let Some(Commands::RebuildIndex) = args.command {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        match eng.rebuild_search_index(None).await? {
+            Some(r) => println!(
+                "rebuilt index: {} chunks, {} reflections (build {} ms, publish {} ms, compaction epoch {})",
+                r.chunks,
+                r.reflections,
+                r.build.as_millis(),
+                r.publish.as_millis(),
+                r.epoch
+            ),
+            None => anyhow::bail!("index rebuild did not complete"),
+        }
+        return Ok(());
     }
 
     if let Some(Commands::Daemon {
@@ -709,6 +734,12 @@ mod tests {
             }
             other => panic!("expected the daemon subcommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rebuild_index_is_a_subcommand() {
+        let args = Args::try_parse_from(["csr-engine", "rebuild-index"]).unwrap();
+        assert!(matches!(args.command, Some(Commands::RebuildIndex)));
     }
 
     #[test]

@@ -76,6 +76,101 @@ pub struct SearchEngine {
     /// still forced a rebuild, that meant a full rebuild on every single
     /// startup). See `dump_to_disk`'s doc comment for the full reasoning.
     manifest_backed: bool,
+    /// The manifest `compaction_epoch` this engine's maps descend from: read
+    /// by `load_from_disk`, advanced by a dump that publishes a compaction.
+    compaction_epoch: u64,
+    /// Set by [`Self::mark_as_compaction`] on an engine just rebuilt from the
+    /// whole of SQLite, so its next dump publishes a new compaction epoch.
+    publishes_compaction: bool,
+    /// Whether this engine already logged that a dump was skipped because a
+    /// newer compaction is on disk (logged once per engine, not per dump).
+    stale_epoch_logged: bool,
+}
+
+/// Filename of the marker a foreground `Engine::new` writes under the index
+/// directory when the loaded cache is materially tombstoned. The daemon's
+/// compaction loop, or the explicit `rebuild-index` command, consumes it.
+pub const NEEDS_COMPACTION_MARKER: &str = "needs_compaction";
+
+/// A side of the index is materially tombstoned once more than 1 in this many
+/// of its id-map slots are blank (hnsw_rs cannot delete, so a blanked slot
+/// stays in the graph until a full rebuild).
+const ORPHAN_REBUILD_DIVISOR: usize = 20;
+
+/// Whether `blank` blank slots out of `slots` is a material share.
+fn tombstones_material_share(blank: usize, slots: usize) -> bool {
+    blank * ORPHAN_REBUILD_DIVISOR > slots.max(1)
+}
+
+/// Write the `needs_compaction` marker if it is not already there. Returns
+/// whether this call created it. Best-effort: a failed write only delays a
+/// compaction, so it is logged and swallowed.
+pub fn mark_needs_compaction(index_dir: &Path) -> bool {
+    let path = index_dir.join(NEEDS_COMPACTION_MARKER);
+    if path.exists() {
+        return false;
+    }
+    match std::fs::write(&path, b"") {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to write needs_compaction marker (non-fatal)");
+            false
+        }
+    }
+}
+
+/// Whether the `needs_compaction` marker is present.
+pub fn needs_compaction(index_dir: &Path) -> bool {
+    index_dir.join(NEEDS_COMPACTION_MARKER).exists()
+}
+
+/// Remove the `needs_compaction` marker. Best-effort.
+pub fn clear_needs_compaction(index_dir: &Path) {
+    let _ = std::fs::remove_file(index_dir.join(NEEDS_COMPACTION_MARKER));
+}
+
+/// Blank-slot counts in the published manifest, for deciding whether a
+/// compaction marker is still current. `None` when there is no readable
+/// manifest of the current version.
+pub fn on_disk_tombstones(dir: &Path) -> Option<TombstoneCounts> {
+    let raw = std::fs::read_to_string(dir.join("manifest.json")).ok()?;
+    let manifest: IndexManifest = serde_json::from_str(&raw).ok()?;
+    if manifest.version != MANIFEST_VERSION {
+        return None;
+    }
+    let blank = |map: &[String]| map.iter().filter(|s| s.is_empty()).count();
+    Some(TombstoneCounts {
+        chunk_blank: blank(&manifest.chunk_id_map),
+        chunk_slots: manifest.chunk_id_map.len(),
+        reflection_blank: blank(&manifest.reflection_id_map),
+        reflection_slots: manifest.reflection_id_map.len(),
+    })
+}
+
+/// The `compaction_epoch` of the published manifest (0 when absent or unreadable).
+pub fn on_disk_compaction_epoch(dir: &Path) -> u64 {
+    std::fs::read_to_string(dir.join("manifest.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<IndexManifest>(&raw).ok())
+        .map(|m| m.compaction_epoch)
+        .unwrap_or(0)
+}
+
+/// Blank (tombstoned) and total id-map slots per side of an index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TombstoneCounts {
+    pub chunk_blank: usize,
+    pub chunk_slots: usize,
+    pub reflection_blank: usize,
+    pub reflection_slots: usize,
+}
+
+impl TombstoneCounts {
+    /// Whether either side is materially tombstoned (see `ORPHAN_REBUILD_DIVISOR`).
+    pub fn material(&self) -> bool {
+        tombstones_material_share(self.chunk_blank, self.chunk_slots)
+            || tombstones_material_share(self.reflection_blank, self.reflection_slots)
+    }
 }
 
 // HNSW parameters
@@ -124,6 +219,12 @@ struct IndexManifest {
     chunk_basename: String,
     #[serde(default = "default_reflection_basename")]
     reflection_basename: String,
+    /// Incremented by every dump that publishes a full rebuild from SQLite (a
+    /// compaction). `dump_to_disk` refuses to publish maps loaded from an older
+    /// epoch, which would put the pre-compaction tombstones back. Manifests
+    /// written before this field existed read as 0.
+    #[serde(default)]
+    compaction_epoch: u64,
 }
 
 fn default_chunk_basename() -> String {
@@ -159,6 +260,39 @@ impl SearchEngine {
             chunk_dirty: false,
             reflection_dirty: false,
             manifest_backed: false,
+            compaction_epoch: 0,
+            publishes_compaction: false,
+            stale_epoch_logged: false,
+        }
+    }
+
+    /// Mark this engine as a full rebuild from SQLite, so its next successful
+    /// dump publishes a new compaction epoch. Only the two real full-corpus
+    /// rebuilds call this (`Engine::new`'s cache-miss path and
+    /// `Engine::rebuild_search_index`); an ordinary fresh engine that dumps
+    /// keeps the epoch already on disk.
+    pub fn mark_as_compaction(&mut self) {
+        self.publishes_compaction = true;
+    }
+
+    /// The compaction epoch this engine's maps descend from.
+    pub fn compaction_epoch(&self) -> u64 {
+        self.compaction_epoch
+    }
+
+    /// Blank and total id-map slots per side of this in-memory index.
+    pub fn tombstones(&self) -> TombstoneCounts {
+        TombstoneCounts {
+            chunk_blank: self
+                .chunk_id_map
+                .len()
+                .saturating_sub(self.chunk_id_set.len()),
+            chunk_slots: self.chunk_id_map.len(),
+            reflection_blank: self
+                .reflection_id_map
+                .len()
+                .saturating_sub(self.active_reflection_count),
+            reflection_slots: self.reflection_id_map.len(),
         }
     }
 
@@ -600,6 +734,40 @@ impl SearchEngine {
                 .filter(|m| m.version == MANIFEST_VERSION);
         let force_full = existing_manifest.is_none();
 
+        // Compaction guard. A full rebuild publishes a new `compaction_epoch`.
+        // An engine whose maps were loaded from an older epoch still holds the
+        // pre-compaction tombstones: publishing them would undo the compaction,
+        // the next load would request another one, and the daemon would
+        // rebuild the whole corpus again. Skip the publish instead. Everything
+        // this engine added is already in SQLite, and the next process to load
+        // the index backfills it.
+        let disk_epoch = existing_manifest
+            .as_ref()
+            .map(|m| m.compaction_epoch)
+            .unwrap_or(0);
+        if self.manifest_backed && !self.publishes_compaction && self.compaction_epoch < disk_epoch
+        {
+            if !self.stale_epoch_logged {
+                self.stale_epoch_logged = true;
+                tracing::warn!(
+                    loaded_epoch = self.compaction_epoch,
+                    disk_epoch,
+                    "index save skipped: a newer compaction is on disk; this process's \
+                     additions reach the index through the next load's backfill"
+                );
+                crate::telemetry::append_timing_line(&format!(
+                    "CSR index save skipped: loaded compaction epoch {}, disk has {}",
+                    self.compaction_epoch, disk_epoch
+                ));
+            }
+            return Ok(());
+        }
+        let publish_epoch = if self.publishes_compaction {
+            disk_epoch + 1
+        } else {
+            self.compaction_epoch.max(disk_epoch)
+        };
+
         // Dump a side to a NEW generation only when it actually changed (skip empty
         // indices — the generation dump fails on empty; skip untouched indices —
         // nothing changed since the generation on disk was last written, so
@@ -701,9 +869,12 @@ impl SearchEngine {
             active_reflection_count,
             chunk_basename,
             reflection_basename,
+            compaction_epoch: publish_epoch,
         };
 
         write_manifest_atomically(dir, &manifest)?;
+        self.compaction_epoch = publish_epoch;
+        self.publishes_compaction = false;
 
         // Clean numbered generations not referenced by the newly committed manifest.
         cleanup_stale_index_files(dir);
@@ -903,6 +1074,9 @@ impl SearchEngine {
             chunk_dirty: false,
             reflection_dirty: false,
             manifest_backed: true,
+            compaction_epoch: manifest.compaction_epoch,
+            publishes_compaction: false,
+            stale_epoch_logged: false,
         })
     }
 }
@@ -1705,6 +1879,93 @@ mod tests {
     }
 
     #[test]
+    fn compaction_epoch_advances_only_on_a_compaction_and_stale_engines_skip_their_dump() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let chunks = |n: usize| {
+            let mut engine = SearchEngine::new(10);
+            for i in 0..n {
+                engine.insert_chunk(format!("c{i}"), vec![i as f32 / 10.0 + 0.05; 384]);
+            }
+            engine
+        };
+
+        // An ordinary fresh dump keeps the epoch (0 on a new index).
+        chunks(1).dump_to_disk(dir, 1, 0).unwrap();
+        assert_eq!(on_disk_compaction_epoch(dir), 0);
+
+        // A dump marked as a compaction publishes the next epoch.
+        let mut compaction = chunks(2);
+        compaction.mark_as_compaction();
+        compaction.dump_to_disk(dir, 2, 0).unwrap();
+        assert_eq!(on_disk_compaction_epoch(dir), 1);
+        assert_eq!(compaction.compaction_epoch(), 1);
+
+        // Another ordinary fresh dump after it does not bump it.
+        chunks(2).dump_to_disk(dir, 2, 0).unwrap();
+        assert_eq!(on_disk_compaction_epoch(dir), 1);
+
+        // An engine loaded at epoch 1, then overtaken by a second compaction,
+        // must not publish its maps over the compacted ones.
+        let mut loaded = SearchEngine::load_from_disk(dir, 2, 0).unwrap();
+        assert_eq!(loaded.compaction_epoch(), 1);
+        let mut second = chunks(3);
+        second.mark_as_compaction();
+        second.dump_to_disk(dir, 3, 0).unwrap();
+        assert_eq!(on_disk_compaction_epoch(dir), 2);
+        let published = std::fs::read(dir.join("manifest.json")).unwrap();
+
+        loaded.insert_chunk("late".into(), vec![0.9; 384]);
+        loaded.dump_to_disk(dir, 4, 0).unwrap();
+        assert!(
+            std::fs::read(dir.join("manifest.json")).unwrap() == published,
+            "a dump from a pre-compaction engine must leave the compacted manifest as it is"
+        );
+
+        // An engine loaded at the current epoch publishes normally and keeps it.
+        let mut current = SearchEngine::load_from_disk(dir, 3, 0).unwrap();
+        current.insert_chunk("late".into(), vec![0.9; 384]);
+        current.dump_to_disk(dir, 4, 0).unwrap();
+        assert_eq!(on_disk_compaction_epoch(dir), 2);
+        assert_eq!(on_disk_tombstones(dir).unwrap().chunk_slots, 4);
+    }
+
+    #[test]
+    fn tombstone_counts_and_materiality() {
+        let mut engine = SearchEngine::new(10);
+        for i in 0..20 {
+            engine.insert_chunk(format!("c{i}"), vec![0.5; 384]);
+        }
+        engine.remove_chunk("c0");
+        let t = engine.tombstones();
+        assert_eq!((t.chunk_blank, t.chunk_slots), (1, 20));
+        assert!(!t.material(), "1 in 20 is the threshold, not over it");
+        engine.remove_chunk("c1");
+        assert!(engine.tombstones().material(), "2 in 20 is over it");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(on_disk_tombstones(tmp.path()).is_none(), "no manifest yet");
+        engine.dump_to_disk(tmp.path(), 18, 0).unwrap();
+        assert_eq!(on_disk_tombstones(tmp.path()).unwrap(), engine.tombstones());
+    }
+
+    #[test]
+    fn needs_compaction_marker_roundtrip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        assert!(!needs_compaction(dir));
+        assert!(mark_needs_compaction(dir), "first mark creates it");
+        assert!(
+            !mark_needs_compaction(dir),
+            "a present marker is not rewritten"
+        );
+        assert!(needs_compaction(dir));
+        clear_needs_compaction(dir);
+        assert!(!needs_compaction(dir));
+        clear_needs_compaction(dir); // clearing an absent marker is fine
+    }
+
+    #[test]
     fn test_load_accepts_drift_in_both_directions() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
@@ -1808,6 +2069,7 @@ mod tests {
             active_reflection_count: 0,
             chunk_basename: default_chunk_basename(),
             reflection_basename: default_reflection_basename(),
+            compaction_epoch: 0,
         };
         std::fs::write(
             dir.join("manifest.json"),
@@ -2016,6 +2278,7 @@ mod tests {
             active_reflection_count: 0,
             chunk_basename: default_chunk_basename(),
             reflection_basename: default_reflection_basename(),
+            compaction_epoch: 0,
         };
 
         write_manifest_atomically(dir, &manifest).unwrap();

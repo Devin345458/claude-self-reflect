@@ -331,6 +331,33 @@ impl Daemon {
         };
         tracing::info!("plans loop started (~/.claude/plans → source='plan' chunks)");
 
+        // Compaction loop: every 5 minutes, consume the `needs_compaction`
+        // marker a foreground `Engine::new` leaves when the loaded index is
+        // materially tombstoned, and run the full rebuild here, out of every
+        // request path. The rebuild checks the shutdown flag between batches.
+        let compaction_handle = {
+            let engine = crate::engine::Engine::from_parts_with_index_dir(
+                self.storage.clone(),
+                self.embeddings.clone(),
+                self.search.clone(),
+                self.projects_dir.clone(),
+                self.index_dir.clone(),
+            );
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                loop {
+                    for _ in 0..30 {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                    compaction_tick(&engine, &shutdown).await;
+                }
+            })
+        };
+        tracing::info!("compaction loop started (needs_compaction marker consumer)");
+
         // Ratification loop — dialog-act scoring (interval via CSR_RATIFICATION_INTERVAL_SECS)
         let ratification_handle = {
             let storage = self.storage.clone();
@@ -387,6 +414,11 @@ impl Daemon {
         // between plans on shutdown, so at most one bounded import is in
         // flight: await it fully.
         let _ = plans_handle.await;
+        // A compaction in flight swaps and publishes the index, so a detached
+        // one could race the shutdown flush below. It stops at the next batch
+        // once the flag is set (or finishes a publish already under way):
+        // await it fully.
+        let _ = compaction_handle.await;
         let _ = tokio::time::timeout(timeout, ratification_handle).await;
         watcher_handle.abort(); // Watcher uses notify which doesn't check shutdown flag
         if let Some(handle) = mcp_http_handle {
@@ -410,6 +442,84 @@ impl Daemon {
 
         tracing::info!("daemon stopped");
         Ok(())
+    }
+}
+
+/// What one pass of the compaction loop did.
+#[derive(Debug)]
+pub enum CompactionOutcome {
+    /// No `needs_compaction` marker.
+    NoMarker,
+    /// Marker present but no readable manifest to judge it by; left in place.
+    NoManifest,
+    /// Marker present but the published index is no longer materially
+    /// tombstoned (a process that loaded the pre-compaction generation set it
+    /// again). Cleared without a rebuild.
+    StaleMarkerCleared(crate::search::TombstoneCounts),
+    Rebuilt(crate::engine::RebuildReport),
+    /// Shutdown was requested while the rebuild streamed. Nothing published.
+    Cancelled,
+    Failed(String),
+}
+
+/// One compaction check: rebuild only when the marker is present AND the
+/// published manifest is still materially tombstoned. Every outcome except
+/// `NoMarker` is written to hook-timing.log, because the daemon's tracing
+/// output is warn-level only.
+pub async fn compaction_tick(
+    engine: &crate::engine::Engine,
+    shutdown: &Arc<AtomicBool>,
+) -> CompactionOutcome {
+    let index_dir = engine.index_dir().to_path_buf();
+    if !crate::search::needs_compaction(&index_dir) {
+        return CompactionOutcome::NoMarker;
+    }
+    let dir = index_dir.clone();
+    let counts = tokio::task::spawn_blocking(move || crate::search::on_disk_tombstones(&dir))
+        .await
+        .ok()
+        .flatten();
+    let Some(counts) = counts else {
+        crate::telemetry::append_timing_line(
+            "CSR compaction: marker found but no readable manifest, will retry",
+        );
+        return CompactionOutcome::NoManifest;
+    };
+    if !counts.material() {
+        crate::search::clear_needs_compaction(&index_dir);
+        crate::telemetry::append_timing_line(&format!(
+            "CSR compaction: marker cleared, published index not material (chunk tombstones {}/{}, reflection tombstones {}/{})",
+            counts.chunk_blank, counts.chunk_slots, counts.reflection_blank, counts.reflection_slots,
+        ));
+        return CompactionOutcome::StaleMarkerCleared(counts);
+    }
+    crate::telemetry::append_timing_line(&format!(
+        "CSR compaction: started (chunk tombstones {}/{}, reflection tombstones {}/{})",
+        counts.chunk_blank, counts.chunk_slots, counts.reflection_blank, counts.reflection_slots,
+    ));
+    match engine.rebuild_search_index(Some(shutdown.clone())).await {
+        Ok(Some(report)) => {
+            crate::telemetry::append_timing_line(&format!(
+                "CSR compaction: done chunks={} reflections={} build={}ms publish={}ms epoch={}",
+                report.chunks,
+                report.reflections,
+                report.build.as_millis(),
+                report.publish.as_millis(),
+                report.epoch,
+            ));
+            CompactionOutcome::Rebuilt(report)
+        }
+        Ok(None) => {
+            crate::telemetry::append_timing_line(
+                "CSR compaction: cancelled by shutdown, nothing published",
+            );
+            CompactionOutcome::Cancelled
+        }
+        Err(e) => {
+            crate::telemetry::append_timing_line(&format!("CSR compaction: failed: {e}"));
+            tracing::warn!(error = %e, "compaction rebuild failed");
+            CompactionOutcome::Failed(e.to_string())
+        }
     }
 }
 
