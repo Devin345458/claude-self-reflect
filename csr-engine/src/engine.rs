@@ -23,6 +23,11 @@ fn log_timing(line: &str) {
 /// the store a moment later, so a single mismatch is usually that gap.
 const COUNT_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Minimum time between two chunk-side reloads. A reload reads every chunk
+/// vector; if something keeps the counts apart, this caps the cost at one
+/// reload per window instead of one per sync.
+const CHUNK_RELOAD_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Highest SQLite rowid of each embedding table already applied to the
 /// in-memory stores. Rows above it were written after the last load or sync.
 #[derive(Default)]
@@ -71,6 +76,8 @@ pub struct Engine {
     /// False only between [`Engine::new_unloaded`] and the end of the first
     /// [`Engine::load_vectors`].
     vectors_ready: Arc<AtomicBool>,
+    /// When the chunk side was last reloaded by a sync.
+    last_chunk_reload: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 fn side_mut(idx: &mut SearchEngine, table: VectorTable) -> &mut VectorStore {
@@ -114,6 +121,7 @@ impl Engine {
             projects_dir,
             watermarks: Arc::new(Watermarks::default()),
             vectors_ready: Arc::new(AtomicBool::new(true)),
+            last_chunk_reload: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -223,15 +231,24 @@ impl Engine {
         Ok(())
     }
 
-    /// Reload one side from SQLite, holding the write lock as
-    /// [`Self::load_vectors`] does.
+    /// Rebuild one side from SQLite after a count mismatch.
+    ///
+    /// The side is built without holding the lock, so searches keep running
+    /// on the current store (a chunk build takes 3 s quiet and over a minute
+    /// on a saturated machine). It is swapped in under the write lock, then
+    /// rows written during the build are applied on top. A row deleted during
+    /// the build can survive into the new side; the next sync's count check
+    /// catches that.
     async fn reload_side(&self, table: VectorTable) -> Result<()> {
-        let mut idx = self.search.write().await;
         let storage = self.storage.clone();
         let (store, max) =
             tokio::task::spawn_blocking(move || load_side(&storage, table)).await??;
-        *side_mut(&mut idx, table) = store;
-        self.watermarks.of(table).store(max, Ordering::Release);
+        {
+            let mut idx = self.search.write().await;
+            *side_mut(&mut idx, table) = store;
+            self.watermarks.of(table).store(max, Ordering::Release);
+        }
+        self.apply_new_rows(table).await?;
         Ok(())
     }
 
@@ -250,7 +267,7 @@ impl Engine {
             if !self.count_matches(table).await? {
                 tokio::time::sleep(COUNT_RECHECK_DELAY).await;
                 self.apply_new_rows(table).await?;
-                if !self.count_matches(table).await? {
+                if !self.count_matches(table).await? && self.reload_allowed(table) {
                     self.reload_side(table).await?;
                     reloaded = true;
                 }
@@ -270,6 +287,24 @@ impl Engine {
             log_timing(&format!("CSR vectors resynced: {report:?}"));
         }
         Ok(report)
+    }
+
+    /// Whether a sync may reload `table` now. Reflections (about 14k) always;
+    /// chunks at most once per [`CHUNK_RELOAD_MIN_INTERVAL`].
+    fn reload_allowed(&self, table: VectorTable) -> bool {
+        if table == VectorTable::Reflections {
+            return true;
+        }
+        let mut last = self
+            .last_chunk_reload
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let now = std::time::Instant::now();
+        if last.is_some_and(|t| now.duration_since(t) < CHUNK_RELOAD_MIN_INTERVAL) {
+            return false;
+        }
+        *last = Some(now);
+        true
     }
 
     async fn apply_new_rows(&self, table: VectorTable) -> Result<usize> {
@@ -298,7 +333,7 @@ impl Engine {
     async fn count_matches(&self, table: VectorTable) -> Result<bool> {
         let storage = self.storage.clone();
         let db = tokio::task::spawn_blocking(move || storage.count_vectors(table)).await??;
-        Ok(side(&*self.search.read().await, table).len() == db)
+        Ok(side(&*self.search.read().await, table).len_with_rejected() == db)
     }
 
     /// Import conversations from the Claude projects directory.
@@ -737,6 +772,22 @@ mod tests {
         assert!(
             !e.sync_vectors().await.unwrap().changed(),
             "second sync finds nothing new"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_vector_in_sqlite_is_not_mistaken_for_drift() {
+        let c = Corpus::new();
+        let s = c.storage();
+        s.insert_chunk(&chunk("ok"), &vec_for(1)).unwrap();
+        s.insert_chunk(&chunk("zero"), &[0.0_f32; 384]).unwrap();
+        drop(s);
+        let e = Engine::new(&c.db, &c.projects).unwrap();
+        assert_eq!(e.search().read().await.chunk_count(), 1);
+        let report = e.sync_vectors().await.unwrap();
+        assert!(
+            !report.changed(),
+            "a zero vector must not trigger reloads: {report:?}"
         );
     }
 

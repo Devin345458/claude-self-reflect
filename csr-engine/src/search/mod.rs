@@ -36,6 +36,10 @@ pub struct VectorStore {
     data: Vec<f32>,
     ids: Vec<String>,
     rows: HashMap<String, usize>,
+    /// Ids whose last upsert was refused (wrong dimension, zero vector). They
+    /// exist in SQLite but not here, so count comparisons add them back:
+    /// otherwise one bad row reads as permanent drift.
+    rejected: HashSet<String>,
 }
 
 impl VectorStore {
@@ -45,7 +49,13 @@ impl VectorStore {
             data: Vec::new(),
             ids: Vec::with_capacity(rows),
             rows: HashMap::with_capacity(rows),
+            rejected: HashSet::new(),
         }
+    }
+
+    /// Stored rows plus refused ones: the number SQLite should hold.
+    pub fn len_with_rejected(&self) -> usize {
+        self.ids.len() + self.rejected.len()
     }
 
     pub fn len(&self) -> usize {
@@ -73,6 +83,19 @@ impl VectorStore {
     /// nothing) for an empty vector, a vector whose length differs from the
     /// store's dimension, or a zero vector.
     pub fn upsert(&mut self, id: String, embedding: &[f32]) -> bool {
+        let ok = self.upsert_inner(&id, embedding);
+        if ok {
+            self.rejected.remove(&id);
+        } else {
+            // A refused replacement also drops the old vector: SQLite no
+            // longer holds it.
+            self.remove_row(&id);
+            self.rejected.insert(id);
+        }
+        ok
+    }
+
+    fn upsert_inner(&mut self, id: &str, embedding: &[f32]) -> bool {
         if embedding.is_empty() {
             return false;
         }
@@ -96,7 +119,7 @@ impl VectorStore {
             return false;
         }
         let dim = self.dim;
-        match self.rows.get(&id) {
+        match self.rows.get(id) {
             Some(&row) => {
                 let dst = &mut self.data[row * dim..(row + 1) * dim];
                 for (d, s) in dst.iter_mut().zip(embedding) {
@@ -106,8 +129,8 @@ impl VectorStore {
             None => {
                 let row = self.ids.len();
                 self.data.extend(embedding.iter().map(|s| s / norm));
-                self.rows.insert(id.clone(), row);
-                self.ids.push(id);
+                self.rows.insert(id.to_string(), row);
+                self.ids.push(id.to_string());
             }
         }
         true
@@ -115,6 +138,11 @@ impl VectorStore {
 
     /// Remove `id`. Returns whether it was present.
     pub fn remove(&mut self, id: &str) -> bool {
+        let refused = self.rejected.remove(id);
+        self.remove_row(id) || refused
+    }
+
+    fn remove_row(&mut self, id: &str) -> bool {
         let Some(row) = self.rows.remove(id) else {
             return false;
         };
@@ -561,6 +589,23 @@ mod tests {
             s.upsert("b".into(), &[1.0, 0.0, 0.0]),
             "a new dimension is accepted once empty"
         );
+    }
+
+    #[test]
+    fn refused_rows_still_count_toward_the_sqlite_total() {
+        let mut s = VectorStore::default();
+        s.upsert("good".into(), &[1.0, 0.0]);
+        s.upsert("zero".into(), &[0.0, 0.0]);
+        assert_eq!((s.len(), s.len_with_rejected()), (1, 2));
+        // Fixed later: counted once, as a real row.
+        s.upsert("zero".into(), &[0.0, 1.0]);
+        assert_eq!((s.len(), s.len_with_rejected()), (2, 2));
+        // A refused replacement drops the old vector but still counts.
+        s.upsert("good".into(), &[0.0, 0.0, 1.0]);
+        assert!(!s.contains("good"));
+        assert_eq!((s.len(), s.len_with_rejected()), (1, 2));
+        assert!(s.remove("good"), "removing a refused id is a real removal");
+        assert_eq!(s.len_with_rejected(), 1);
     }
 
     #[test]
