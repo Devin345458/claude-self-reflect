@@ -342,13 +342,14 @@ impl Engine {
         let projects = import::discover_projects(&self.projects_dir)?;
         let mut total = 0usize;
 
-        for (dir, project_name) in &projects {
+        for (dir, _) in &projects {
             let files = import::list_jsonl_files(dir)?;
             for file_path in &files {
                 if self.storage.is_file_imported(file_path)? {
                     continue;
                 }
-                total += self.import_file(file_path, project_name).await?;
+                let label = import::project_label_for_transcript(file_path);
+                total += self.import_file(file_path, &label).await?;
 
                 if let Some(lim) = limit {
                     if total >= lim {
@@ -464,7 +465,7 @@ impl Engine {
         let mut conv_to_file: std::collections::HashMap<String, (std::path::PathBuf, String)> =
             std::collections::HashMap::new();
 
-        for (dir, project_name) in &projects {
+        for (dir, _) in &projects {
             if let Ok(files) = import::list_jsonl_files(dir) {
                 for file_path in files {
                     let conv_id = file_path
@@ -472,7 +473,8 @@ impl Engine {
                         .unwrap_or_default()
                         .to_string_lossy()
                         .to_string();
-                    conv_to_file.insert(conv_id, (file_path, project_name.clone()));
+                    let label = import::project_label_for_transcript(&file_path);
+                    conv_to_file.insert(conv_id, (file_path, label));
                 }
             }
         }

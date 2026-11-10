@@ -23,12 +23,40 @@ const CREATE_CHUNKS_FTS_TRIGGERS: &str = "
         INSERT INTO chunks_fts(chunks_fts, rowid, content)
         VALUES ('delete', old.rowid, old.content);
     END;
-    CREATE TRIGGER chunks_fts_au AFTER UPDATE ON chunks BEGIN
+    CREATE TRIGGER chunks_fts_au AFTER UPDATE OF content ON chunks BEGIN
         INSERT INTO chunks_fts(chunks_fts, rowid, content)
         VALUES ('delete', old.rowid, old.content);
         INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
     END;
 ";
+
+/// The full-text index holds only `content`. An unconditional update trigger
+/// rewrote a chunk's index entry on every label change; relabelling the
+/// 636k mislabelled chunks of 2026-11-10 would have rewritten them all.
+fn narrow_chunks_fts_update_trigger(conn: &Connection) -> Result<()> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'chunks_fts_au'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(sql) = sql else { return Ok(()) };
+    if sql.contains("UPDATE OF content") {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         DROP TRIGGER IF EXISTS chunks_fts_au;
+         CREATE TRIGGER chunks_fts_au AFTER UPDATE OF content ON chunks BEGIN
+             INSERT INTO chunks_fts(chunks_fts, rowid, content)
+             VALUES ('delete', old.rowid, old.content);
+             INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+         END;
+         COMMIT;",
+    )?;
+    Ok(())
+}
 
 const DROP_CHUNKS_FTS_TRIGGERS: &str = "
     DROP TRIGGER IF EXISTS chunks_fts_ai;
@@ -933,6 +961,7 @@ pub fn run(conn: &Connection) -> Result<()> {
     )?;
 
     finish_chunks_fts_compaction(conn)?;
+    narrow_chunks_fts_update_trigger(conn)?;
 
     Ok(())
 }

@@ -113,6 +113,13 @@ enum Commands {
     /// Ask the running daemon to reload every vector from SQLite. Rarely
     /// needed: the daemon loads them at startup and syncs every 30 seconds.
     RebuildIndex,
+    /// Give every stored chunk of a Claude Code session the project label its
+    /// transcript's start directory resolves to (the label new imports and the
+    /// MCP scope use). Dry run unless --apply.
+    RelabelProjects {
+        #[arg(long)]
+        apply: bool,
+    },
     /// Ask the daemon whether it is up: prints its vector counts and queue
     /// depth as JSON, or exits 1 when it does not answer within 2 seconds.
     DaemonPing,
@@ -282,6 +289,15 @@ async fn run() -> Result<()> {
 
     if let Some(Commands::Telemetry { since, json, tui }) = args.command {
         return csr_engine::telemetry::handle(&args.db_path, &args.projects_dir, since, json, tui);
+    }
+
+    if let Some(Commands::RelabelProjects { apply }) = args.command {
+        let storage = csr_engine::storage::Storage::open(&args.db_path)?;
+        let t = std::time::Instant::now();
+        let stats = csr_engine::import::relabel::relabel_projects(&storage, apply)?;
+        print!("{}", stats.render(apply));
+        println!("took {} ms", t.elapsed().as_millis());
+        return Ok(());
     }
 
     if let Some(Commands::DaemonPing) = args.command {

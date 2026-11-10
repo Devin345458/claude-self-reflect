@@ -165,12 +165,8 @@ impl FileWatcher {
             return Ok(());
         }
 
-        // Infer project name from parent directory
-        let project_name = file_path
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|n| import::normalize_project_name(&n.to_string_lossy()))
-            .unwrap_or_else(|| "unknown".to_string());
+        // One label per session, the same one its hooks and MCP scope resolve.
+        let project_name = import::project_label_for_transcript(file_path);
 
         let chunks = import::parse_jsonl_file(file_path, &project_name)?;
         if chunks.is_empty() {
@@ -198,6 +194,7 @@ impl FileWatcher {
         // `summary`/`seq`/`timestamp` are deterministic re-derivations of the same
         // prefix bytes, so they cannot drift without `content` drifting too.
         let mut reindexed = 0usize;
+        let mut relabeled = 0usize;
         let mut unchanged = 0usize;
         for batch in chunks.chunks(BATCH_SIZE) {
             let ids: Vec<String> = batch.iter().map(|c| c.id.clone()).collect();
@@ -207,11 +204,22 @@ impl FileWatcher {
                 .into_iter()
                 .map(|chunk| (chunk.id.clone(), chunk))
                 .collect();
-            let pending: Vec<&ConversationChunk> = batch
-                .iter()
-                .filter(|chunk| needs_reindex(chunk, stored.get(&chunk.id)))
-                .collect();
-            unchanged += batch.len() - pending.len();
+            let mut pending: Vec<&ConversationChunk> = Vec::new();
+            for chunk in batch {
+                match change_for(chunk, stored.get(&chunk.id)) {
+                    Change::None => unchanged += 1,
+                    // Same text, so the same embedding: fix the label in place.
+                    Change::Scope => {
+                        self.storage.update_chunk_scope(
+                            &chunk.id,
+                            &chunk.project_name,
+                            chunk.is_sidechain,
+                        )?;
+                        relabeled += 1;
+                    }
+                    Change::Content => pending.push(chunk),
+                }
+            }
             reindexed += pending.len();
             if pending.is_empty() {
                 continue;
@@ -267,6 +275,7 @@ impl FileWatcher {
             file = %file_path.display(),
             chunks = chunk_count,
             reindexed,
+            relabeled,
             unchanged,
             project = %project_name,
             "auto-imported conversation"
@@ -286,14 +295,30 @@ impl FileWatcher {
 /// storage write is an upsert keyed on that same id: re-running it with
 /// identical values produces a byte-identical row, an identical embedding, and
 /// an identical FTS document.
-fn needs_reindex(parsed: &ConversationChunk, stored: Option<&ConversationChunk>) -> bool {
+/// How a freshly parsed chunk differs from the stored row with its id.
+#[derive(Debug, PartialEq, Eq)]
+enum Change {
+    /// Identical where it matters.
+    None,
+    /// Same text, different label or sidechain flag: no new embedding needed.
+    Scope,
+    /// New chunk or new text: embed and store.
+    Content,
+}
+
+/// Compared fields are the ones that decide what search returns: `content`
+/// (the indexed text) and `project_name`/`is_sidechain`, which scope it.
+fn change_for(parsed: &ConversationChunk, stored: Option<&ConversationChunk>) -> Change {
     match stored {
-        None => true,
-        Some(stored) => {
-            stored.content != parsed.content
-                || stored.project_name != parsed.project_name
-                || stored.is_sidechain != parsed.is_sidechain
+        None => Change::Content,
+        Some(stored) if stored.content != parsed.content => Change::Content,
+        Some(stored)
+            if stored.project_name != parsed.project_name
+                || stored.is_sidechain != parsed.is_sidechain =>
+        {
+            Change::Scope
         }
+        Some(_) => Change::None,
     }
 }
 
@@ -319,7 +344,7 @@ mod tests {
 
     #[test]
     fn unseen_chunk_is_indexed() {
-        assert!(needs_reindex(&chunk("a", "hello"), None));
+        assert_eq!(change_for(&chunk("a", "hello"), None), Change::Content);
     }
 
     #[test]
@@ -328,7 +353,7 @@ mod tests {
         // chunk unchanged, and those must cost neither an embedding nor a write.
         let parsed = chunk("a", "hello");
         let stored = chunk("a", "hello");
-        assert!(!needs_reindex(&parsed, Some(&stored)));
+        assert_eq!(change_for(&parsed, Some(&stored)), Change::None);
     }
 
     #[test]
@@ -336,18 +361,48 @@ mod tests {
         // The last chunk of a live session is partial and gains text on append.
         let stored = chunk("a", "hello");
         let parsed = chunk("a", "hello there");
-        assert!(needs_reindex(&parsed, Some(&stored)));
+        assert_eq!(change_for(&parsed, Some(&stored)), Change::Content);
     }
 
     #[test]
-    fn rescoped_chunk_is_reindexed() {
+    fn rescoped_chunk_is_relabeled_without_a_new_embedding() {
         let stored = chunk("a", "hello");
         let mut parsed = chunk("a", "hello");
         parsed.project_name = "other".to_string();
-        assert!(needs_reindex(&parsed, Some(&stored)));
+        assert_eq!(change_for(&parsed, Some(&stored)), Change::Scope);
 
         let mut parsed = chunk("a", "hello");
         parsed.is_sidechain = true;
-        assert!(needs_reindex(&parsed, Some(&stored)));
+        assert_eq!(change_for(&parsed, Some(&stored)), Change::Scope);
+
+        // New text and a new label: the text wins, it needs an embedding.
+        let mut parsed = chunk("a", "hello there");
+        parsed.project_name = "other".to_string();
+        assert_eq!(change_for(&parsed, Some(&stored)), Change::Content);
+    }
+
+    #[test]
+    fn a_label_only_update_changes_the_row_but_not_the_embedding() {
+        let storage = Storage::open_memory().unwrap();
+        let mut c = chunk("a", "hello");
+        c.project_name = "-Users-u-PhpstormProjects-app".into();
+        storage.insert_chunk(&c, &[0.5_f32; 384]).unwrap();
+        assert!(storage.update_chunk_scope("a", "app", false).unwrap());
+        assert!(
+            !storage.update_chunk_scope("a", "app", false).unwrap(),
+            "no-op second time"
+        );
+        let row = &storage.get_chunks_by_ids(&["a".to_string()]).unwrap()[0];
+        assert_eq!(row.project_name, "app");
+        assert_eq!(row.content, "hello");
+        let mut n = 0;
+        storage
+            .stream_vectors_after(crate::storage::VectorTable::Chunks, 0, |id, v| {
+                assert_eq!(id, "a");
+                assert_eq!(v[0], 0.5);
+                n += 1;
+            })
+            .unwrap();
+        assert_eq!(n, 1, "embedding untouched");
     }
 }

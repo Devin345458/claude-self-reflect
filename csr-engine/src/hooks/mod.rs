@@ -152,8 +152,8 @@ pub async fn import_current_transcript(input: &HookInput, engine: &Engine, cwd: 
         return;
     }
 
-    let cwd_str = cwd.to_string_lossy();
-    let project = resolve_project_from_cwd(&cwd_str).unwrap_or_else(|| "unknown".to_string());
+    let _ = cwd;
+    let project = crate::import::project_label_for_transcript(&canonical);
 
     match engine.import_file(&canonical, &project).await {
         Ok(0) => {} // no new content, silent

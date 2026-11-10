@@ -2,6 +2,7 @@ pub mod backfill;
 pub mod coedit_backfill;
 pub mod plans;
 pub mod registry;
+pub mod relabel;
 pub mod watcher;
 
 use std::fs;
@@ -84,6 +85,61 @@ pub fn normalize_project_name(dir_name: &str) -> String {
     } else {
         final_component.to_string()
     }
+}
+
+/// Lines and bytes [`transcript_start_dir`] reads before giving up. Claude
+/// Code writes `cwd` on the first message, a handful of lines in.
+const START_DIR_MAX_LINES: usize = 400;
+const START_DIR_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// The directory a Claude Code session started in: the first top-level `cwd`
+/// its transcript records. `None` when the first lines carry none (other
+/// transcript formats, such as Codex rollouts).
+pub fn transcript_start_dir(path: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let file = fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    let mut read = 0usize;
+    for _ in 0..START_DIR_MAX_LINES {
+        line.clear();
+        let n = reader.read_line(&mut line).ok()?;
+        if n == 0 {
+            return None;
+        }
+        read += n;
+        if line.contains("\"cwd\"") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+                    if !cwd.is_empty() {
+                        return Some(cwd.to_string());
+                    }
+                }
+            }
+        }
+        if read > START_DIR_MAX_BYTES {
+            return None;
+        }
+    }
+    None
+}
+
+/// The project label a transcript's chunks are stored under: the project of
+/// the directory the session started in, by the same rule the hooks and the
+/// MCP scope use for that session
+/// (`crate::search::cross_project::resolve_project_from_cwd`). Every import
+/// path labels through this, so a session's chunks carry one label and a
+/// scoped search finds them. Falls back to the transcript folder's name when
+/// the transcript records no directory.
+pub fn project_label_for_transcript(path: &Path) -> String {
+    transcript_start_dir(path)
+        .and_then(|cwd| crate::search::cross_project::resolve_project_from_cwd(&cwd))
+        .unwrap_or_else(|| {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .map(|n| normalize_project_name(&n.to_string_lossy()))
+                .unwrap_or_else(|| "unknown".to_string())
+        })
 }
 
 /// Discover all project directories under the Claude projects base path.
@@ -858,5 +914,66 @@ mod tests {
         let text = extract_message_text(&msg);
         assert!(!text.contains("sk-abc123"));
         assert!(text.contains("[private]"));
+    }
+
+    fn transcript_with_cwd(dir: &Path, folder: &str, cwd: Option<&str>) -> PathBuf {
+        let d = dir.join(folder);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("conv.jsonl");
+        let mut lines = vec![
+            r#"{"type":"summary","summary":"x"}"#.to_string(),
+            r#"{"type":"file-history-snapshot","snapshot":{}}"#.to_string(),
+        ];
+        let cwd_line = match cwd {
+            Some(c) => format!(
+                r#"{{"type":"user","cwd":{},"message":{{"content":"hi"}}}}"#,
+                serde_json::to_string(c).unwrap()
+            ),
+            None => r#"{"type":"user","message":{"content":"hi"}}"#.to_string(),
+        };
+        lines.push(cwd_line);
+        std::fs::write(&f, lines.join("\n") + "\n").unwrap();
+        f
+    }
+
+    #[test]
+    fn transcript_label_is_the_project_of_the_start_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "-Users-u-PhpstormProjects-visilaunch",
+                "/Users/u/PhpstormProjects/visilaunch",
+                "visilaunch",
+            ),
+            (
+                "-Users-u-orca-workspaces-shopr-co2-b12d",
+                "/Users/u/orca/workspaces/shopr/co2-b12d",
+                "co2-b12d",
+            ),
+            ("-Users-u", "/Users/u", "u"),
+            (
+                "-Users-u-Library-CloudStorage-GoogleDrive-u-x-com-My-Drive-Quotes",
+                "/Users/u/Library/CloudStorage/GoogleDrive-u@x.com/My Drive/Quotes",
+                "Quotes",
+            ),
+        ];
+        for (folder, cwd, want) in cases {
+            let f = transcript_with_cwd(tmp.path(), folder, Some(cwd));
+            assert_eq!(transcript_start_dir(&f).as_deref(), Some(cwd));
+            assert_eq!(project_label_for_transcript(&f), want, "{folder}");
+            assert_eq!(
+                crate::search::cross_project::resolve_project_from_cwd(cwd).as_deref(),
+                Some(want),
+                "the MCP scope must resolve the same label for {cwd}"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_without_a_start_directory_falls_back_to_the_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = transcript_with_cwd(tmp.path(), "-Users-u-projects-thing", None);
+        assert_eq!(transcript_start_dir(&f), None);
+        assert_eq!(project_label_for_transcript(&f), "thing");
     }
 }

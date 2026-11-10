@@ -138,6 +138,34 @@ impl Storage {
         queries::insert_chunk(&conn, chunk, embedding)
     }
 
+    /// Change a stored chunk's label and sidechain flag without touching its
+    /// content or embedding. Returns whether a row changed.
+    pub fn update_chunk_scope(
+        &self,
+        id: &str,
+        project_name: &str,
+        is_sidechain: bool,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let n = conn.execute(
+            "UPDATE chunks SET project_name = ?2, is_sidechain = ?3
+             WHERE id = ?1 AND (project_name != ?2 OR is_sidechain != ?3)",
+            rusqlite::params![id, project_name, is_sidechain as i64],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Relabel every chunk of a conversation that is not already `project_name`.
+    /// Returns the number of rows changed.
+    pub fn relabel_conversation(&self, conversation_id: &str, project_name: &str) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        Ok(conn.execute(
+            "UPDATE chunks SET project_name = ?2
+             WHERE conversation_id = ?1 AND project_name != ?2 AND source = 'conversation'",
+            rusqlite::params![conversation_id, project_name],
+        )?)
+    }
+
     pub fn load_all_chunk_vectors(&self) -> Result<Vec<(String, Vec<f32>)>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::load_all_chunk_vectors(&conn)

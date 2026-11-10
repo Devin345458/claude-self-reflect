@@ -41,10 +41,7 @@ use anyhow::Result;
 use crate::engine::Engine;
 use crate::extraction::ast_analysis::lang_from_path_str;
 use crate::extraction::codegraph::extract_graph_fragment;
-use crate::import::{
-    discover_projects, list_jsonl_files, normalize_project_name, parse_jsonl_file,
-    parse_jsonl_messages,
-};
+use crate::import::{discover_projects, list_jsonl_files, parse_jsonl_file, parse_jsonl_messages};
 use crate::storage::codegraph::EdgeRow;
 use crate::storage::Storage;
 
@@ -223,7 +220,7 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
     //    project name and mtime.
     let projects = discover_projects(projects_dir)?;
     let mut files: Vec<(PathBuf, String, SystemTime)> = Vec::new();
-    for (dir, project_name) in &projects {
+    for (dir, _) in &projects {
         let jsonls = match list_jsonl_files(dir) {
             Ok(j) => j,
             Err(e) => {
@@ -235,7 +232,9 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
             let mtime = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            files.push((path, project_name.clone(), mtime));
+            // The label the live post-tool-use hook writes for this session.
+            let label = crate::import::project_label_for_transcript(&path);
+            files.push((path, label, mtime));
         }
     }
 
@@ -451,11 +450,7 @@ pub fn backfill_saga_columns(engine: &Engine) -> Result<SagaBackfillStats> {
             eprintln!("CSR saga backfill: skip missing {file_path}");
             continue;
         }
-        let project_name = path
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|n| normalize_project_name(&n.to_string_lossy()))
-            .unwrap_or_default();
+        let project_name = crate::import::project_label_for_transcript(path);
         let chunks = match parse_jsonl_file(path, &project_name) {
             Ok(c) => c,
             Err(e) => {
