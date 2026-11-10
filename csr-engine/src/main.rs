@@ -285,7 +285,7 @@ async fn run() -> Result<()> {
     }
 
     if let Some(Commands::DaemonPing) = args.command {
-        let socket = csr_engine::daemon::hook_server::default_socket_path();
+        let socket = csr_engine::daemon::hook_server::socket_path_for(&args.db_path);
         let request = csr_engine::daemon::hook_server::HookRequest {
             hook: "ping".into(),
             input: String::new(),
@@ -321,7 +321,7 @@ async fn run() -> Result<()> {
     if let Some(Commands::RebuildIndex) = args.command {
         // Vectors live only in the daemon's memory, rebuilt from SQLite at
         // startup. This asks the running daemon to reload them now.
-        let socket = csr_engine::daemon::hook_server::default_socket_path();
+        let socket = csr_engine::daemon::hook_server::socket_path_for(&args.db_path);
         let request = csr_engine::daemon::hook_server::HookRequest {
             hook: "reload-vectors".into(),
             input: String::new(),
@@ -569,7 +569,7 @@ async fn run() -> Result<()> {
             return Ok(());
         }
 
-        csr_engine::daemon::hook_server::run_client(name);
+        csr_engine::daemon::hook_server::run_client(name, &args.db_path);
         return Ok(());
     }
 

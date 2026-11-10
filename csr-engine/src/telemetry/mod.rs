@@ -92,6 +92,9 @@ pub struct Telemetry {
 
 /// Resolve the canonical log path: `~/.claude-self-reflect/hook-timing.log`.
 pub fn default_log_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("CSR_TIMING_LOG") {
+        return Some(PathBuf::from(p));
+    }
     dirs::home_dir().map(|h| h.join(".claude-self-reflect").join("hook-timing.log"))
 }
 

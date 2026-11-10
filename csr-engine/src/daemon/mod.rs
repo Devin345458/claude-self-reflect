@@ -77,6 +77,7 @@ impl Daemon {
         } else {
             None
         };
+        let hook_socket = hook_server::socket_path_for(&db_path_of(&engine));
         Self {
             storage: engine.storage().clone(),
             embeddings: engine.embeddings().clone(),
@@ -84,7 +85,7 @@ impl Daemon {
             projects_dir: engine.projects_dir().to_path_buf(),
             engine,
             config,
-            hook_socket: hook_server::default_socket_path(),
+            hook_socket,
             api_client,
             mcp_http_addr: None,
         }
@@ -108,15 +109,14 @@ impl Daemon {
         self
     }
 
-    /// Acquire a lockfile to prevent multiple daemon instances.
+    /// Acquire a lockfile so only one daemon serves this database. The lock
+    /// sits beside the database, so a daemon run against a copy (staging, a
+    /// test) does not collide with the live one.
     /// Uses OS-level advisory locking (flock) via the fs2 crate.
-    pub fn acquire_lock() -> Result<std::fs::File> {
+    pub fn acquire_lock(lock_dir: &Path) -> Result<std::fs::File> {
         use fs2::FileExt;
 
-        let lock_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".claude-self-reflect");
-        std::fs::create_dir_all(&lock_dir)?;
+        std::fs::create_dir_all(lock_dir)?;
         let lock_path = lock_dir.join("daemon.lock");
 
         let file = std::fs::OpenOptions::new()
@@ -143,7 +143,8 @@ impl Daemon {
 
     /// Run the daemon: file watcher + extraction loop + narrator loop.
     pub async fn run(self) -> Result<()> {
-        let _lock = Self::acquire_lock()?;
+        let db_path = db_path_of(&self.engine);
+        let _lock = Self::acquire_lock(db_path.parent().unwrap_or(Path::new(".")))?;
         tracing::info!("daemon started, acquired lockfile");
 
         // Shared shutdown flag for graceful termination (D-8)
@@ -447,6 +448,20 @@ impl Daemon {
         tracing::info!("daemon stopped");
         Ok(())
     }
+}
+
+/// The engine's database file, or the default location for an in-memory one.
+fn db_path_of(engine: &crate::engine::Engine) -> PathBuf {
+    engine
+        .storage()
+        .path()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".claude-self-reflect")
+                .join("csr-engine.db")
+        })
 }
 
 /// Wait for Ctrl+C (SIGINT) or SIGTERM. launchd stops the agent with SIGTERM.

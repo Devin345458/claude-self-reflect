@@ -108,14 +108,18 @@ pub fn hook_kind(hook: &str) -> Option<HookKind> {
     }
 }
 
-/// `CSR_DAEMON_SOCKET`, or `~/.claude-self-reflect/daemon.sock`.
-pub fn default_socket_path() -> PathBuf {
+/// The daemon's socket for the database at `db_path`: `CSR_DAEMON_SOCKET` if
+/// set, else `daemon.sock` beside the database. The hook client derives it
+/// from the same default database path the daemon opens, so they always meet,
+/// and a daemon run against a copy of the database never collides with the
+/// live one.
+pub fn socket_path_for(db_path: &Path) -> PathBuf {
     if let Some(p) = std::env::var_os("CSR_DAEMON_SOCKET") {
         return PathBuf::from(p);
     }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".claude-self-reflect")
+    db_path
+        .parent()
+        .unwrap_or(Path::new("."))
         .join("daemon.sock")
 }
 
@@ -396,9 +400,9 @@ fn connect(socket: &Path) -> Result<std::os::unix::net::UnixStream> {
 }
 
 /// The client half of `csr-engine hook <name>`: forward stdin to the daemon
-/// and print the reply. Always returns normally: a hook must never fail or
-/// block Claude Code.
-pub fn run_client(hook: &str) {
+/// serving `db_path` and print the reply. Always returns normally: a hook must
+/// never fail or block Claude Code.
+pub fn run_client(hook: &str, db_path: &Path) {
     let t0 = Instant::now();
     let mut input = String::new();
     {
@@ -421,7 +425,7 @@ pub fn run_client(hook: &str) {
         Some(HookKind::Reply) => REPLY_BUDGET,
         _ => ACK_BUDGET,
     };
-    let socket = default_socket_path();
+    let socket = socket_path_for(db_path);
     match send(&socket, &request, budget) {
         Ok(reply) => {
             if let Some(err) = &reply.error {
