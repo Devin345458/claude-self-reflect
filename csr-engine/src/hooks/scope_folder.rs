@@ -83,6 +83,15 @@ impl Budget {
         }
     }
 
+    /// One folder name decoded for `import::relabel`, off any request path.
+    fn for_relabel() -> Self {
+        Self {
+            dir_reads: 4096,
+            git_calls: 0,
+            deadline: Instant::now() + Duration::from_secs(10),
+        }
+    }
+
     fn expired(&self) -> bool {
         Instant::now() >= self.deadline
     }
@@ -297,6 +306,21 @@ fn asker_repository(
         }
     }
     Some((place.common_dir, territory))
+}
+
+/// The directory a transcript's Claude Code folder encodes (the session's
+/// start directory), decoded against the filesystem under `fs_root` as it is
+/// now. Works when the transcript itself is gone: only its recorded path is
+/// needed. `None` when the path is not under the projects directory or the
+/// folder decodes to no directory or to more than one.
+pub(crate) fn decoded_start_dir(
+    fs_root: &Path,
+    projects_dir: &Path,
+    file_path: &str,
+) -> Option<PathBuf> {
+    let roots = projects_roots(projects_dir);
+    let folder = transcript_folder(&roots, file_path)?;
+    decode_folder(fs_root, folder, &mut Budget::for_relabel())
 }
 
 /// The Claude Code folder a transcript file lives in: the immediate child of

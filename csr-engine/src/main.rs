@@ -294,7 +294,8 @@ async fn run() -> Result<()> {
     if let Some(Commands::RelabelProjects { apply }) = args.command {
         let storage = csr_engine::storage::Storage::open(&args.db_path)?;
         let t = std::time::Instant::now();
-        let stats = csr_engine::import::relabel::relabel_projects(&storage, apply)?;
+        let stats =
+            csr_engine::import::relabel::relabel_projects(&storage, &args.projects_dir, apply)?;
         print!("{}", stats.render(apply));
         println!("took {} ms", t.elapsed().as_millis());
         return Ok(());

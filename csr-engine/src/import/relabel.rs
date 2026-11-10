@@ -15,8 +15,11 @@
 //! [`crate::import::project_label_for_transcript`]. This pass applies the
 //! same rule to what is already stored: for each Claude Code transcript in
 //! `import_state`, read the directory the session started in and relabel
-//! that conversation's chunks to its project. Transcripts that record no
-//! directory, or that are gone, are left as they are.
+//! that conversation's chunks to its project. When the transcript is gone
+//! (Claude Code deletes old ones), the start directory is decoded from the
+//! dash-encoded folder in its recorded path, against the filesystem as it is
+//! now (`hooks::scope_folder::decoded_start_dir`). Conversations where neither
+//! works are left as they are.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -35,6 +38,8 @@ pub struct RelabelStats {
     pub without_start_dir: usize,
     /// One conversation id, transcripts whose start directories disagree.
     pub ambiguous: usize,
+    /// Labelled from the decoded transcript folder (transcript gone or silent).
+    pub decoded_from_folder: usize,
     pub conversations_relabeled: usize,
     pub chunks_relabeled: usize,
     /// (old label, new label) to chunk count.
@@ -49,8 +54,9 @@ impl RelabelStats {
             "would relabel"
         };
         let mut out = format!(
-            "checked {} conversations: {} transcripts missing, {} without a start directory, {} ambiguous\n{verb} {} chunks in {} conversations\n",
+            "checked {} conversations: {} labelled from their folder, {} left (transcript gone and folder undecodable), {} without a start directory, {} ambiguous\n{verb} {} chunks in {} conversations\n",
             self.conversations_checked,
+            self.decoded_from_folder,
             self.transcripts_missing,
             self.without_start_dir,
             self.ambiguous,
@@ -68,7 +74,21 @@ impl RelabelStats {
 
 /// Relabel stored chunks to the label their transcript resolves to. With
 /// `apply` false nothing is written.
-pub fn relabel_projects(storage: &Storage, apply: bool) -> Result<RelabelStats> {
+pub fn relabel_projects(
+    storage: &Storage,
+    projects_dir: &Path,
+    apply: bool,
+) -> Result<RelabelStats> {
+    relabel_projects_in(storage, Path::new("/"), projects_dir, apply)
+}
+
+/// [`relabel_projects`] with the filesystem root folder names decode against.
+fn relabel_projects_in(
+    storage: &Storage,
+    fs_root: &Path,
+    projects_dir: &Path,
+    apply: bool,
+) -> Result<RelabelStats> {
     let rows: Vec<(String, String)> = storage.with_connection(|conn| {
         let mut stmt = conn.prepare(
             "SELECT conversation_id, file_path FROM import_state
@@ -86,6 +106,7 @@ pub fn relabel_projects(storage: &Storage, apply: bool) -> Result<RelabelStats> 
     }
 
     let mut stats = RelabelStats::default();
+    let mut folder_labels: HashMap<String, Option<String>> = HashMap::new();
     let mut convs: Vec<_> = by_conv.into_iter().collect();
     convs.sort();
     for (conv, paths) in convs {
@@ -106,8 +127,31 @@ pub fn relabel_projects(storage: &Storage, apply: bool) -> Result<RelabelStats> 
                 None => no_dir += 1,
             }
         }
+        let mut from_folder = false;
+        if labels.is_empty() {
+            for p in &paths {
+                let label = folder_labels
+                    .entry(p.clone())
+                    .or_insert_with(|| {
+                        crate::hooks::scope_folder::decoded_start_dir(fs_root, projects_dir, p)
+                            .and_then(|dir| {
+                                crate::search::cross_project::resolve_project_from_cwd(
+                                    &dir.to_string_lossy(),
+                                )
+                            })
+                    })
+                    .clone();
+                if let Some(l) = label {
+                    labels.push(l);
+                    from_folder = true;
+                }
+            }
+        }
         labels.sort();
         labels.dedup();
+        if from_folder && labels.len() == 1 {
+            stats.decoded_from_folder += 1;
+        }
         let label = match labels.as_slice() {
             [one] => one.clone(),
             [] if missing > 0 && no_dir == 0 => {
@@ -224,7 +268,7 @@ mod tests {
         s.mark_file_imported(&tmp.path().join("conv-c.jsonl"), 1)
             .unwrap();
 
-        let dry = relabel_projects(&s, false).unwrap();
+        let dry = relabel_projects_in(&s, tmp.path(), &tmp.path().join("projects"), false).unwrap();
         assert_eq!(dry.chunks_relabeled, 1);
         assert_eq!(
             label_of(&s, "a1"),
@@ -232,7 +276,7 @@ mod tests {
             "dry run writes nothing"
         );
 
-        let done = relabel_projects(&s, true).unwrap();
+        let done = relabel_projects_in(&s, tmp.path(), &tmp.path().join("projects"), true).unwrap();
         assert_eq!(
             (done.conversations_relabeled, done.chunks_relabeled),
             (1, 1)
@@ -244,8 +288,43 @@ mod tests {
         assert_eq!(label_of(&s, "b1"), "-Users-u-somewhere");
         assert_eq!(label_of(&s, "c1"), "-Users-u-gone");
 
-        let again = relabel_projects(&s, true).unwrap();
+        let again =
+            relabel_projects_in(&s, tmp.path(), &tmp.path().join("projects"), true).unwrap();
         assert_eq!(again.chunks_relabeled, 0, "idempotent");
+    }
+
+    #[test]
+    fn a_gone_transcript_is_labelled_from_its_decoded_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The session's start directory still exists; its transcript does not.
+        std::fs::create_dir_all(tmp.path().join("Users/u/PhpstormProjects/latina.web")).unwrap();
+        let projects = tmp.path().join("projects");
+        let folder = projects.join("-Users-u-PhpstormProjects-latina-web");
+        std::fs::create_dir_all(&folder).unwrap();
+        let s = Storage::open_memory().unwrap();
+        s.insert_chunk(
+            &chunk("m1", "conv-m", "-Users-u-PhpstormProjects-latina-web"),
+            &[0.1; 384],
+        )
+        .unwrap();
+        s.mark_file_imported(&folder.join("conv-m.jsonl"), 1)
+            .unwrap();
+        // A subagent transcript, also gone, labelled by its folder name.
+        s.insert_chunk(&chunk("g1", "agent-1", "subagents"), &[0.1; 384])
+            .unwrap();
+        s.mark_file_imported(&folder.join("conv-m/subagents/agent-1.jsonl"), 1)
+            .unwrap();
+        // A folder whose directory no longer exists stays as it is.
+        s.insert_chunk(&chunk("x1", "conv-x", "-Users-u-gone"), &[0.1; 384])
+            .unwrap();
+        s.mark_file_imported(&projects.join("-Users-u-gone/conv-x.jsonl"), 1)
+            .unwrap();
+
+        let done = relabel_projects_in(&s, tmp.path(), &projects, true).unwrap();
+        assert_eq!(done.decoded_from_folder, 2);
+        assert_eq!(label_of(&s, "m1"), "latina.web");
+        assert_eq!(label_of(&s, "g1"), "latina.web");
+        assert_eq!(label_of(&s, "x1"), "-Users-u-gone");
     }
 
     #[test]
