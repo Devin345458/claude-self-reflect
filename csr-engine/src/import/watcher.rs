@@ -18,20 +18,16 @@ const DEBOUNCE_SECS: u64 = 5;
 /// Batch size for embedding during auto-import.
 const BATCH_SIZE: usize = 10;
 
-/// Minimum time between the watcher's full index dumps. Each one rewrites the
-/// whole chunk side (1.7 GB on a real install) under the exclusive index lock;
-/// dumping after every 5 s debounce batch wrote it about four times a minute,
-/// and hooks starved waiting for the lock. Rows imported in between are in
-/// SQLite, and every process that loads the index backfills them.
-const FULL_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+/// The running watcher's queue, so a hook handled inside the daemon can hand
+/// it a transcript path instead of importing the file itself.
+static NUDGE: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<PathBuf>> =
+    std::sync::OnceLock::new();
 
-/// Whether the watcher's periodic full dump is due.
-fn full_flush_due(
-    last_full_flush: std::time::Instant,
-    now: std::time::Instant,
-    interval: std::time::Duration,
-) -> bool {
-    now.saturating_duration_since(last_full_flush) >= interval
+/// Queue `path` for the watcher's next import pass. Returns false when no
+/// watcher is running in this process (or it has stopped), so the caller can
+/// import the file itself.
+pub fn nudge(path: PathBuf) -> bool {
+    NUDGE.get().is_some_and(|tx| tx.send(path).is_ok())
 }
 
 /// Watches the Claude projects directory for new JSONL files and auto-imports them.
@@ -40,7 +36,6 @@ pub struct FileWatcher {
     storage: Arc<Storage>,
     embeddings: Arc<EmbeddingEngine>,
     search: Arc<RwLock<SearchEngine>>,
-    index_dir: PathBuf,
 }
 
 impl FileWatcher {
@@ -49,14 +44,12 @@ impl FileWatcher {
         storage: Arc<Storage>,
         embeddings: Arc<EmbeddingEngine>,
         search: Arc<RwLock<SearchEngine>>,
-        index_dir: PathBuf,
     ) -> Self {
         Self {
             projects_dir,
             storage,
             embeddings,
             search,
-            index_dir,
         }
     }
 
@@ -72,6 +65,7 @@ impl FileWatcher {
     /// Main watcher loop: watches for new JSONL files, debounces, and imports.
     async fn run(&self) -> Result<()> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+        let _ = NUDGE.set(tx.clone());
 
         // Create the notify watcher — sends events via a closure that bridges to tokio channel
         let sender = tx.clone();
@@ -93,10 +87,6 @@ impl FileWatcher {
         // Watch the projects directory recursively
         watcher.watch(&self.projects_dir, RecursiveMode::Recursive)?;
         tracing::info!(dir = %self.projects_dir.display(), "file watcher started");
-
-        // The clock starts now: the first full dump comes one interval after the
-        // watcher starts (the daemon's shutdown flush covers a short run).
-        let mut last_full_flush = std::time::Instant::now();
 
         // Debounce loop: collect changed files over DEBOUNCE_SECS, then process
         loop {
@@ -143,25 +133,6 @@ impl FileWatcher {
                             error = %e,
                             "failed to import file"
                         );
-                    }
-                }
-
-                // Flush HNSW index to disk, at most once per FULL_FLUSH_INTERVAL.
-                // A batch after a quiet spell flushes as soon as it lands.
-                if !full_flush_due(
-                    last_full_flush,
-                    std::time::Instant::now(),
-                    FULL_FLUSH_INTERVAL,
-                ) {
-                    continue;
-                }
-                last_full_flush = std::time::Instant::now();
-                let mut idx = self.search.write().await;
-                if idx.is_dirty() {
-                    let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
-                    let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
-                    if let Err(e) = idx.dump_to_disk(&self.index_dir, chunk_count, refl_count) {
-                        tracing::warn!(error = %e, "failed to flush HNSW index after watcher batch");
                     }
                 }
             }
@@ -261,24 +232,6 @@ impl FileWatcher {
             }
         }
 
-        // A hook process may have stored some of these chunks before this pass.
-        // Their rows are byte-identical, so the loop above skips them, but this
-        // index has never held them. Load their stored vectors, or every dump of
-        // this index omits them and every hook process re-inserts them at startup.
-        let backfilled = {
-            let mut idx = self.search.write().await;
-            let missing: Vec<String> = chunks
-                .iter()
-                .filter(|c| !idx.has_chunk(&c.id))
-                .map(|c| c.id.clone())
-                .collect();
-            if missing.is_empty() {
-                0
-            } else {
-                crate::engine::backfill_missing_chunks(&self.storage, &mut idx, &missing)?
-            }
-        };
-
         self.storage.mark_file_imported(file_path, chunk_count)?;
 
         // Layer 1: Heuristic enrichment (inline, instant, free)
@@ -315,7 +268,6 @@ impl FileWatcher {
             chunks = chunk_count,
             reindexed,
             unchanged,
-            backfilled,
             project = %project_name,
             "auto-imported conversation"
         );
@@ -349,20 +301,6 @@ fn needs_reindex(parsed: &ConversationChunk, stored: Option<&ConversationChunk>)
 mod tests {
     use super::*;
     use crate::provenance::Speaker;
-
-    #[test]
-    fn full_flush_waits_for_the_interval() {
-        use std::time::{Duration, Instant};
-        let t0 = Instant::now();
-        let interval = Duration::from_secs(600);
-        assert!(!full_flush_due(t0, t0, interval));
-        assert!(!full_flush_due(t0, t0 + Duration::from_secs(599), interval));
-        assert!(full_flush_due(t0, t0 + interval, interval));
-        assert!(
-            !full_flush_due(t0 + Duration::from_secs(5), t0, interval),
-            "a last-flush time after `now` never counts as due"
-        );
-    }
 
     fn chunk(id: &str, content: &str) -> ConversationChunk {
         ConversationChunk {
@@ -411,57 +349,5 @@ mod tests {
         let mut parsed = chunk("a", "hello");
         parsed.is_sidechain = true;
         assert!(needs_reindex(&parsed, Some(&stored)));
-    }
-
-    const HOOK_FIRST_TRANSCRIPT: &str = r#"{"type":"user","message":{"content":[{"type":"text","text":"Fix the race condition in HNSW persistence that causes stale index on restart"}]},"timestamp":"2026-02-22T15:00:00Z"}
-{"type":"assistant","message":{"content":[{"type":"text","text":"I see the issue. The dump_to_disk function doesn't acquire a lock."}]},"timestamp":"2026-02-22T15:00:01Z"}
-{"type":"user","message":{"content":[{"type":"text","text":"Good, now add fs2 advisory locking"}]},"timestamp":"2026-02-22T15:00:02Z"}
-{"type":"assistant","message":{"content":[{"type":"text","text":"Added fs2 lock_exclusive before file dump."}]},"timestamp":"2026-02-22T15:00:03Z"}
-"#;
-
-    /// A hook process can import a transcript before the daemon's watcher sees
-    /// it. The stored rows are then byte-identical to what the watcher parses,
-    /// so `needs_reindex` skips them, but the watcher's in-memory index has never
-    /// held them. They must still enter that index. Otherwise every daemon dump
-    /// omits them and every hook process re-inserts them at startup through the
-    /// additive backfill in `Engine::new` (3,480 chunks and 5.6 s per hook on
-    /// 2026-10-29, growing until the daemon restarts).
-    #[tokio::test]
-    async fn chunk_stored_by_another_process_still_enters_the_index() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let project_dir = tmp.path().join("-Users-test-proj");
-        std::fs::create_dir_all(&project_dir).unwrap();
-        let transcript = project_dir.join("conv-hook-first.jsonl");
-        std::fs::write(&transcript, HOOK_FIRST_TRANSCRIPT).unwrap();
-
-        let project_name = import::normalize_project_name("-Users-test-proj");
-        let chunks = import::parse_jsonl_file(&transcript, &project_name).unwrap();
-        assert!(!chunks.is_empty(), "fixture must produce chunks");
-
-        // What the hook process left behind: rows and vectors in SQLite.
-        let storage = Arc::new(Storage::open_memory().unwrap());
-        for c in &chunks {
-            storage.insert_chunk(c, &[0.1f32; 384]).unwrap();
-        }
-        // The daemon's own index, which never saw them.
-        let search = Arc::new(RwLock::new(SearchEngine::new(16)));
-        let watcher = FileWatcher::new(
-            tmp.path().to_path_buf(),
-            storage,
-            Arc::new(EmbeddingEngine::new().unwrap()),
-            search.clone(),
-            tmp.path().join("index"),
-        );
-
-        watcher.import_file(&transcript).await.unwrap();
-
-        let idx = search.read().await;
-        for c in &chunks {
-            assert!(
-                idx.has_chunk(&c.id),
-                "chunk {} is in SQLite but missing from the watcher's index",
-                c.id
-            );
-        }
     }
 }

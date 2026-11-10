@@ -53,7 +53,7 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
         eprintln!("CSR: session-start hook error (non-fatal): {}", e);
         // Output minimal context so session gets SOMETHING rather than silent "Success"
         // Keep error details on stderr only — don't leak internal paths to Claude's context
-        println!("CSR engine ready (degraded mode).");
+        crate::hook_println!("CSR engine ready (degraded mode).");
     }
     Ok(()) // Always succeed
 }
@@ -285,7 +285,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     write_focus_file(project_name, &output);
 
     // Agent context (stdout → Claude sees as additionalContext)
-    println!("{output}");
+    crate::hook_println!("{output}");
     Ok(())
 }
 

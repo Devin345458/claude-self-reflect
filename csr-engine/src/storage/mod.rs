@@ -6,7 +6,7 @@ pub use queries::{
     NarrativeUsageRow, NarrativeUsageSummary, RatificationScoreRow, ResolutionEntry,
 };
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -18,6 +18,16 @@ use crate::import::ConversationChunk;
 /// Thread-safe via Mutex around the Connection.
 pub struct Storage {
     conn: Mutex<Connection>,
+    /// The database file, or `None` for an in-memory database. Lets bulk
+    /// readers open their own connection instead of holding `conn`.
+    path: Option<PathBuf>,
+}
+
+/// Which embedding table a vector stream reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorTable {
+    Chunks,
+    Reflections,
 }
 
 impl Storage {
@@ -54,6 +64,7 @@ impl Storage {
         migrations::run(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            path: Some(path.to_path_buf()),
         })
     }
 
@@ -64,7 +75,60 @@ impl Storage {
         migrations::run(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            path: None,
         })
+    }
+
+    /// The database file, or `None` for an in-memory database.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Stream every `(id, vector)` in `table` whose rowid is above `after`,
+    /// in rowid order, into `f`. Returns the highest rowid seen (`after` when
+    /// there were none).
+    ///
+    /// For a file database this reads on a private read-only connection, so a
+    /// full load (about 1.4 GB for 900k chunks) never holds the shared
+    /// connection and other storage calls keep running. Rows whose blob is not
+    /// a whole number of f32s are skipped.
+    pub fn stream_vectors_after(
+        &self,
+        table: VectorTable,
+        after: i64,
+        f: impl FnMut(&str, &[f32]),
+    ) -> Result<i64> {
+        match &self.path {
+            Some(path) => {
+                let reader = Connection::open_with_flags(
+                    path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?;
+                reader.busy_timeout(std::time::Duration::from_secs(10))?;
+                queries::stream_vectors_after(&reader, table, after, f)
+            }
+            None => {
+                let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                queries::stream_vectors_after(&conn, table, after, f)
+            }
+        }
+    }
+
+    /// Every id in `table`.
+    pub fn vector_ids(&self, table: VectorTable) -> Result<Vec<String>> {
+        match table {
+            VectorTable::Chunks => self.load_all_chunk_ids(),
+            VectorTable::Reflections => self.load_all_reflection_ids(),
+        }
+    }
+
+    /// Row count of `table`.
+    pub fn count_vectors(&self, table: VectorTable) -> Result<usize> {
+        match table {
+            VectorTable::Chunks => self.count_chunk_embeddings(),
+            VectorTable::Reflections => self.count_reflection_embeddings(),
+        }
     }
 
     // ─── Chunk operations ───
@@ -464,7 +528,7 @@ impl Storage {
         queries::get_chunk_content(&conn, id)
     }
 
-    // ─── Count queries (for HNSW cache staleness) ───
+    // ─── Count queries ───
 
     pub fn count_chunk_embeddings(&self) -> Result<usize> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;

@@ -1199,7 +1199,7 @@ fn test_parse_jsonl_messages() {
     }
 }
 
-// ─── Test 24: HNSW dedup on re-insert ───
+// ─── Test 24: re-inserting an id replaces it instead of duplicating ───
 
 #[test]
 fn test_hnsw_dedup_insert() {
@@ -1219,161 +1219,6 @@ fn test_hnsw_dedup_insert() {
     engine.insert_reflection("ref-1".to_string(), emb.clone());
     engine.insert_reflection("ref-1".to_string(), emb.clone());
     assert_eq!(engine.reflection_count(), 1);
-}
-
-// ─── Test 25: HNSW persistence round-trip ───
-
-#[test]
-fn test_hnsw_persistence_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
-    let index_dir = dir.path().join("index");
-
-    // Build index with 50 chunks + 5 reflections
-    let mut engine = SearchEngine::new(100);
-    for i in 0..50 {
-        let mut emb = vec![0.0f32; 384];
-        emb[i % 384] = 1.0;
-        engine.insert_chunk(format!("chunk-{}", i), emb);
-    }
-    for i in 0..5 {
-        let mut emb = vec![0.0f32; 384];
-        emb[(i + 50) % 384] = 1.0;
-        engine.insert_reflection(format!("refl-{}", i), emb);
-    }
-
-    assert!(engine.is_dirty());
-    engine.dump_to_disk(&index_dir, 50, 5).unwrap();
-    assert!(!engine.is_dirty());
-
-    // Search before dump
-    let mut query = vec![0.0f32; 384];
-    query[0] = 1.0;
-    let results_before = engine.search_chunks(&query, 3, 0.0);
-
-    // Load from disk
-    let loaded = SearchEngine::load_from_disk(&index_dir, 50, 5).unwrap();
-    assert_eq!(loaded.chunk_count(), 50);
-    assert_eq!(loaded.reflection_count(), 5);
-
-    // Search after load — same results
-    let results_after = loaded.search_chunks(&query, 3, 0.0);
-    assert_eq!(results_before.len(), results_after.len());
-    assert_eq!(results_before[0].id, results_after[0].id);
-    assert!((results_before[0].score - results_after[0].score).abs() < 0.01);
-}
-
-// ─── Test 26: Stale index detection ───
-
-#[test]
-fn test_hnsw_stale_index_detection() {
-    let dir = tempfile::tempdir().unwrap();
-    let index_dir = dir.path().join("index");
-
-    // Build and dump with 10 chunks
-    let mut engine = SearchEngine::new(100);
-    for i in 0..10 {
-        let emb = vec![0.1f32; 384];
-        engine.insert_chunk(format!("chunk-{}", i), emb);
-    }
-    engine.dump_to_disk(&index_dir, 10, 0).unwrap();
-
-    // DB grew since the dump (additive drift) — cache loads so Engine::new can
-    // incrementally backfill the new rows instead of doing a full rebuild.
-    let result = SearchEngine::load_from_disk(&index_dir, 15, 0);
-    assert!(
-        result.is_some(),
-        "additive drift should load the cache (backfill), not rebuild"
-    );
-
-    // DB shrank (rows deleted): still loads. Engine::new blanks the orphan ids
-    // against the live DB instead of rebuilding the whole corpus.
-    let result = SearchEngine::load_from_disk(&index_dir, 5, 0);
-    assert!(
-        result.is_some(),
-        "deletion should load the cache for orphan reconciliation, not rebuild"
-    );
-
-    // Exact match should work
-    let result = SearchEngine::load_from_disk(&index_dir, 10, 0);
-    assert!(result.is_some(), "should accept matching cache");
-}
-
-// ─── Test 27: Missing files fallback ───
-
-#[test]
-fn test_hnsw_missing_files_fallback() {
-    let dir = tempfile::tempdir().unwrap();
-    let nonexistent = dir.path().join("nonexistent_index");
-
-    let result = SearchEngine::load_from_disk(&nonexistent, 100, 10);
-    assert!(result.is_none(), "should return None for missing directory");
-}
-
-// ─── Test 28: Soft-deleted reflections survive persistence ───
-
-#[test]
-fn test_hnsw_persistence_soft_delete() {
-    let dir = tempfile::tempdir().unwrap();
-    let index_dir = dir.path().join("index");
-
-    // Insert 5 reflections, remove 1
-    let mut engine = SearchEngine::new(100);
-    for i in 0..5 {
-        let mut emb = vec![0.0f32; 384];
-        emb[i % 384] = 1.0;
-        engine.insert_reflection(format!("refl-{}", i), emb);
-    }
-    assert_eq!(engine.reflection_count(), 5);
-
-    engine.remove_reflection("refl-2");
-    assert_eq!(engine.reflection_count(), 4);
-
-    // Dump and reload — pass DB counts (0 chunks, 5 reflections in DB)
-    engine.dump_to_disk(&index_dir, 0, 5).unwrap();
-
-    // Load expects DB counts to match manifest
-    let loaded = SearchEngine::load_from_disk(&index_dir, 0, 5).unwrap();
-    assert_eq!(loaded.reflection_count(), 4);
-
-    // Searching should not return the removed reflection
-    let mut query = vec![0.0f32; 384];
-    query[2] = 1.0; // Most similar to refl-2
-    let results = loaded.search_reflections(&query, 10, 0.0);
-    for r in &results {
-        assert_ne!(
-            r.id, "refl-2",
-            "removed reflection should not appear after reload"
-        );
-    }
-}
-
-// ─── Test 29: Cached load timing ───
-
-#[test]
-fn test_hnsw_cached_load_timing() {
-    let dir = tempfile::tempdir().unwrap();
-    let index_dir = dir.path().join("index");
-
-    // Build a 1000-vector index
-    let mut engine = SearchEngine::new(2000);
-    for i in 0..1000 {
-        let mut emb = vec![0.0f32; 384];
-        emb[i % 384] = (i as f32 + 1.0) / 1000.0;
-        engine.insert_chunk(format!("perf-chunk-{}", i), emb);
-    }
-    engine.dump_to_disk(&index_dir, 1000, 0).unwrap();
-
-    // Time the cached load
-    let start = std::time::Instant::now();
-    let loaded = SearchEngine::load_from_disk(&index_dir, 1000, 0);
-    let elapsed = start.elapsed();
-
-    assert!(loaded.is_some(), "cached load should succeed");
-    assert!(
-        elapsed.as_millis() < 500,
-        "cached load took {}ms, expected <500ms",
-        elapsed.as_millis()
-    );
 }
 
 // ─── LAPI: Phase-Aware Scoring ───
@@ -1848,6 +1693,7 @@ fn test_hook_exits_at_its_deadline_instead_of_running_on() {
         .env("CSR_HOOK_DEADLINE_SECS", "2")
         .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
         .env_remove("CSR_HOOK_DETACHED")
+        .env_remove("CSR_DAEMON_SOCKET")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1897,6 +1743,7 @@ fn test_hook_exits_at_its_deadline_instead_of_running_on() {
         .env("CSR_HOOK_DEADLINE_SECS", "30")
         .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
         .env_remove("CSR_HOOK_DETACHED")
+        .env_remove("CSR_DAEMON_SOCKET")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -143,9 +143,30 @@ fn classify_add_failure(stderr: &str) -> AddFailure {
     }
 }
 
-fn mcp_add(binary_str: &str) -> std::io::Result<std::process::Output> {
+/// Where the daemon serves MCP. The LaunchAgent (see `crate::agent`) starts
+/// the daemon listening here, and setup registers this URL.
+pub const DAEMON_MCP_ADDR: &str = "127.0.0.1:7391";
+
+/// The MCP URL Claude Code is registered with.
+pub fn daemon_mcp_url() -> String {
+    format!("http://{DAEMON_MCP_ADDR}/mcp")
+}
+
+/// Register the daemon's HTTP endpoint. Every session shares the daemon's one
+/// copy of the vectors; a stdio registration would start a separate engine,
+/// with its own full copy, for every session.
+fn mcp_add(_binary_str: &str) -> std::io::Result<std::process::Output> {
     std::process::Command::new("claude")
-        .args(["mcp", "add", MCP_SERVER_NAME, binary_str, "-s", "user"])
+        .args([
+            "mcp",
+            "add",
+            "--transport",
+            "http",
+            MCP_SERVER_NAME,
+            &daemon_mcp_url(),
+            "-s",
+            "user",
+        ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
@@ -345,6 +366,17 @@ fn register_mcp_server() -> Result<(), McpFailure> {
         )
     })?;
     let binary_str = binary_path.to_string_lossy().to_string();
+
+    // Already registered over HTTP at the daemon's URL: nothing to do.
+    if current_mcp_entry()
+        .as_ref()
+        .and_then(|e| e.get("url"))
+        .and_then(|u| u.as_str())
+        == Some(daemon_mcp_url().as_str())
+    {
+        eprintln!("  Already registered at {}", daemon_mcp_url());
+        return Ok(());
+    }
 
     let output = match mcp_add(&binary_str) {
         Ok(output) => output,

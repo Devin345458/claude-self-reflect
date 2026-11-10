@@ -298,7 +298,7 @@ async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> 
 fn resolve_project_for_hook(file_path_parent: Option<&Path>) -> String {
     resolve_project_for_hook_with(
         file_path_parent,
-        std::env::var("CLAUDE_PROJECT_DIR").ok(),
+        super::context::env_var("CLAUDE_PROJECT_DIR"),
         crate::search::cross_project::resolve_current_project(),
     )
 }

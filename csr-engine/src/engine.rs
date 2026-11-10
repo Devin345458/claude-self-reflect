@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -10,270 +10,295 @@ use crate::embeddings::EmbeddingEngine;
 use crate::import;
 use crate::import::watcher::FileWatcher;
 use crate::mcp::CsrServer;
-use crate::search::SearchEngine;
-use crate::storage::Storage;
+use crate::search::{SearchEngine, VectorStore};
+use crate::storage::{Storage, VectorTable};
 
 /// Append a timing line to ~/.claude-self-reflect/hook-timing.log.
 fn log_timing(line: &str) {
     crate::telemetry::append_timing_line(line);
 }
 
-/// Initial HNSW capacity for an import-only engine's empty in-memory index.
-/// Only a construction hint — hnsw_rs grows as needed — sized to comfortably
-/// hold one session's worth of new chunks without reallocation.
-const IMPORT_ONLY_INDEX_CAPACITY: usize = 4096;
+/// How long [`Engine::sync_vectors`] waits before re-checking a side whose row
+/// count disagrees with SQLite. The daemon's own writes touch SQLite and then
+/// the store a moment later, so a single mismatch is usually that gap.
+const COUNT_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Highest SQLite rowid of each embedding table already applied to the
+/// in-memory stores. Rows above it were written after the last load or sync.
+#[derive(Default)]
+struct Watermarks {
+    chunks: AtomicI64,
+    reflections: AtomicI64,
+}
+
+impl Watermarks {
+    fn of(&self, table: VectorTable) -> &AtomicI64 {
+        match table {
+            VectorTable::Chunks => &self.chunks,
+            VectorTable::Reflections => &self.reflections,
+        }
+    }
+}
+
+/// What [`Engine::sync_vectors`] changed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VectorSyncReport {
+    pub chunks_added: usize,
+    pub reflections_added: usize,
+    pub chunks_reloaded: bool,
+    pub reflections_reloaded: bool,
+}
+
+impl VectorSyncReport {
+    pub fn changed(&self) -> bool {
+        self.chunks_added + self.reflections_added > 0
+            || self.chunks_reloaded
+            || self.reflections_reloaded
+    }
+}
 
 /// Orchestrates all subsystems: storage, embeddings, search, import, and MCP.
+///
+/// SQLite is the only thing on disk. The vectors live in memory in one
+/// process (the daemon), which builds them from SQLite at startup.
 #[derive(Clone)]
 pub struct Engine {
     storage: Arc<Storage>,
     embeddings: Arc<EmbeddingEngine>,
     search: Arc<RwLock<SearchEngine>>,
     projects_dir: PathBuf,
-    index_dir: PathBuf,
-    /// When true, the engine never loads the on-disk HNSW cache at construction
-    /// and `flush_index` is a no-op. Used by write-only hooks (precompact,
-    /// session-end) that import a transcript but never search: they pay neither
-    /// the ~O(corpus) `HnswIo::load_hnsw` at startup nor a full re-dump. New
-    /// embeddings still land in SQLite; the next search-constructing process
-    /// reconciles them via the additive-backfill path in `Engine::new`.
-    ///
-    /// The flush guard is the critical invariant: without it, dispatch_hook's
-    /// unconditional `flush_index` would dump the near-empty in-memory index
-    /// with a manifest count equal to the FULL DB count, which the next
-    /// `load_from_disk` accepts as current — replacing the real many-node graph
-    /// with a handful of points. Recall is not permanently lost (the next
-    /// `Engine::new` compares DB ids against the cache and backfills the missing
-    /// ones), but recovery costs a full re-insert of the corpus, which defeats
-    /// the entire point of the import-only path.
-    skip_index_persistence: bool,
+    watermarks: Arc<Watermarks>,
+    /// False only between [`Engine::new_unloaded`] and the end of the first
+    /// [`Engine::load_vectors`].
+    vectors_ready: Arc<AtomicBool>,
+}
+
+fn side_mut(idx: &mut SearchEngine, table: VectorTable) -> &mut VectorStore {
+    match table {
+        VectorTable::Chunks => idx.chunks_mut(),
+        VectorTable::Reflections => idx.reflections_mut(),
+    }
+}
+
+fn side(idx: &SearchEngine, table: VectorTable) -> &VectorStore {
+    match table {
+        VectorTable::Chunks => idx.chunks(),
+        VectorTable::Reflections => idx.reflections(),
+    }
+}
+
+/// Read every vector of `table` into a new store. Returns it with the highest
+/// rowid read.
+fn load_side(storage: &Storage, table: VectorTable) -> Result<(VectorStore, i64)> {
+    let expected = storage.count_vectors(table).unwrap_or(0);
+    let mut store = VectorStore::with_capacity(expected + expected / 16);
+    let max = storage.stream_vectors_after(table, 0, |id, v| {
+        store.upsert(id.to_owned(), v);
+    })?;
+    Ok((store, max))
 }
 
 impl Engine {
-    /// Create an engine from pre-built components (for testing).
+    /// Create an engine from pre-built components (for testing). The search
+    /// engine is used as given; nothing is loaded from SQLite.
     pub fn from_parts(
         storage: Arc<Storage>,
         embeddings: Arc<EmbeddingEngine>,
         search: Arc<RwLock<SearchEngine>>,
         projects_dir: PathBuf,
     ) -> Self {
-        // Derive index_dir from projects_dir for test constructor
-        let index_dir = projects_dir.join("index");
-        Self::from_parts_with_index_dir(storage, embeddings, search, projects_dir, index_dir)
-    }
-
-    /// Create an engine from pre-built components with an explicit
-    /// `index_dir`. Use this whenever the caller knows its real on-disk index
-    /// directory (the daemon does) instead of `from_parts`'s
-    /// `projects_dir.join("index")`, which is wrong whenever the database and
-    /// the projects tree live in different places (they do on a real install).
-    pub fn from_parts_with_index_dir(
-        storage: Arc<Storage>,
-        embeddings: Arc<EmbeddingEngine>,
-        search: Arc<RwLock<SearchEngine>>,
-        projects_dir: PathBuf,
-        index_dir: PathBuf,
-    ) -> Self {
         Self {
             storage,
             embeddings,
             search,
             projects_dir,
-            index_dir,
-            skip_index_persistence: false,
+            watermarks: Arc::new(Watermarks::default()),
+            vectors_ready: Arc::new(AtomicBool::new(true)),
         }
     }
 
+    /// Open storage and load every vector before returning. For one-shot CLI
+    /// commands and the stdio MCP server, which own their engine for one run.
     pub fn new(db_path: &Path, projects_dir: &Path) -> Result<Self> {
         let t0 = std::time::Instant::now();
-
-        tracing::info!(?db_path, "opening storage");
-        let storage = Arc::new(Storage::open(db_path)?);
-        let t_storage = t0.elapsed();
-
-        tracing::info!("initializing embedding engine");
-        let embeddings = Arc::new(EmbeddingEngine::new()?);
-        let t_embed = t0.elapsed();
-
-        // Compute index cache directory alongside the database
-        let index_dir = db_path.parent().unwrap_or(Path::new(".")).join("index");
-
-        // Fast O(1) counts for staleness check (~1ms)
-        let chunk_count = storage.count_chunk_embeddings()?;
-        let reflection_count = storage.count_reflection_embeddings()?;
-        let t_count = t0.elapsed();
-
-        // Try loading from disk cache first
-        let search = if let Some(cached) =
-            SearchEngine::load_from_disk(&index_dir, chunk_count, reflection_count)
-        {
-            // Track the additive-backfill delta and the loaded cache's
-            // on-disk age purely as a staleness diagnostic (logged below) —
-            // how far behind SQLite the on-disk HNSW cache was at load time,
-            // and how long it's been since anything last flushed it. Local
-            // to this branch; nothing downstream of `Engine::new` reads
-            // either value (there is no cache staleness to report on the
-            // rebuild path below — a fresh dump has zero drift and zero age
-            // by construction).
-            let cache_age = std::fs::metadata(index_dir.join("manifest.json"))
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok());
-
-            let t_total = t0.elapsed();
-            let startup_line = format!(
-                "CSR startup: storage={:.0}ms embed={:.0}ms cache_load={:.0}ms total={:.0}ms ({} chunks, cached)",
-                t_storage.as_secs_f64() * 1000.0,
-                (t_embed - t_storage).as_secs_f64() * 1000.0,
-                (t_total - t_count).as_secs_f64() * 1000.0,
-                t_total.as_secs_f64() * 1000.0,
-                chunk_count,
-            );
-            eprintln!("{}", startup_line);
-            log_timing(&startup_line);
-            tracing::info!(
-                chunks = chunk_count,
-                reflections = reflection_count,
-                "search index loaded from cache"
-            );
-            // Reconcile HNSW cache with DB:
-            // 1. Blank orphan entries (deleted from DB since last dump)
-            // 2. Backfill missing entries (added to DB since last dump)
-            let mut search = cached;
-            let backfill_added = reconcile_search_with_db(
-                &storage,
-                &mut search,
-                storage.load_all_reflection_ids().ok().as_deref(),
-                storage.load_all_chunk_ids().ok().as_deref(),
-            );
-            if backfill_added > 0 {
-                tracing::info!(
-                    backfill_added,
-                    cache_age_secs = cache_age.map(|d| d.as_secs()),
-                    "HNSW cache behind DB at startup — additive backfill applied"
-                );
-            }
-            // hnsw_rs cannot delete, so blanked slots stay in the graph until a
-            // full rebuild. A foreground process never runs that rebuild here
-            // (minutes on a large corpus); it leaves a marker for the daemon's
-            // compaction loop or the explicit `rebuild-index` command. Search
-            // already overfetches past blanked slots in the meantime.
-            let tombstones = search.tombstones();
-            if tombstones.material() && crate::search::mark_needs_compaction(&index_dir) {
-                log_timing(&format!(
-                    "CSR compaction: marked needs_compaction (chunk tombstones {}/{}, reflection tombstones {}/{})",
-                    tombstones.chunk_blank,
-                    tombstones.chunk_slots,
-                    tombstones.reflection_blank,
-                    tombstones.reflection_slots,
-                ));
-            }
-            search
-        } else {
-            // Cache miss — rebuild from SQLite vectors, streaming in bounded
-            // batches so peak transient memory is O(batch) instead of
-            // O(corpus) (no `load_all_chunk_vectors()` + clone-into-index).
-            // The dump below writes a brand-new manifest, so there is no drift
-            // and no stale age to report.
-            tracing::info!("building search index from stored vectors");
-
-            let (mut search, chunk_total, reflection_total) =
-                rebuild_search_index_streaming(&storage, RECONCILE_BATCH)?;
-            let t_hnsw = t0.elapsed();
-
-            // Re-query counts right before dump to minimize staleness window (E-1)
-            let chunk_count = storage.count_chunk_embeddings().unwrap_or(chunk_count);
-            let reflection_count = storage
-                .count_reflection_embeddings()
-                .unwrap_or(reflection_count);
-            // Dump to disk for next startup. A rebuild from the whole of SQLite
-            // is compact by construction: publish it as a new compaction epoch
-            // and satisfy any pending compaction request.
-            search.mark_as_compaction();
-            match search.dump_to_disk(&index_dir, chunk_count, reflection_count) {
-                Ok(()) => crate::search::clear_needs_compaction(&index_dir),
-                Err(e) => tracing::warn!(error = %e, "failed to cache HNSW index (non-fatal)"),
-            }
-            let t_total = t0.elapsed();
-
-            tracing::info!(
-                chunks = chunk_total,
-                reflections = reflection_total,
-                "search index rebuilt and cached"
-            );
-            let startup_line = format!(
-                "CSR startup: storage={:.0}ms embed={:.0}ms hnsw={:.0}ms dump={:.0}ms total={:.0}ms ({} chunks, rebuilt)",
-                t_storage.as_secs_f64() * 1000.0,
-                (t_embed - t_storage).as_secs_f64() * 1000.0,
-                (t_hnsw - t_count).as_secs_f64() * 1000.0,
-                (t_total - t_hnsw).as_secs_f64() * 1000.0,
-                t_total.as_secs_f64() * 1000.0,
-                chunk_total,
-            );
-            eprintln!("{}", startup_line);
-            log_timing(&startup_line);
-
-            search
-        };
-
-        // Clean stale numbered HNSW files from previous sessions (crash resilience).
-        // Needs the exclusive lock to avoid racing concurrent dump_to_disk writers,
-        // but only TRY for it: any other process loading the cache holds the lock
-        // shared, and a blocking request here stalls this startup until all of them
-        // finish. Skipping is safe because every dump_to_disk runs the same cleanup
-        // under its own exclusive lock.
-        if let Ok(lock_file) = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(index_dir.join("index.lock"))
-        {
-            if fs2::FileExt::try_lock_exclusive(&lock_file).is_ok() {
-                crate::search::cleanup_stale_index_files(&index_dir);
-            }
-            // lock released on drop
-        }
-
-        // The index is built and reconciled; hand the allocator's freed transient
-        // pages back to the OS so this server's steady-state footprint reflects live
-        // memory rather than retained slack (macOS-only; no-op elsewhere).
-        crate::runtime::release_freed_pages();
-
-        Ok(Self {
-            storage,
-            embeddings,
-            search: Arc::new(RwLock::new(search)),
-            projects_dir: projects_dir.to_path_buf(),
-            index_dir,
-            skip_index_persistence: false,
-        })
+        let mut engine = Self::new_unloaded(db_path, projects_dir)?;
+        let (chunks, cmax) = load_side(&engine.storage, VectorTable::Chunks)?;
+        let (reflections, rmax) = load_side(&engine.storage, VectorTable::Reflections)?;
+        let idx = Arc::get_mut(&mut engine.search)
+            .expect("a new engine's search index is not shared yet")
+            .get_mut();
+        *idx.chunks_mut() = chunks;
+        *idx.reflections_mut() = reflections;
+        engine.watermarks.chunks.store(cmax, Ordering::Release);
+        engine.watermarks.reflections.store(rmax, Ordering::Release);
+        engine.vectors_ready.store(true, Ordering::Release);
+        tracing::info!(
+            chunks = idx.chunk_count(),
+            reflections = idx.reflection_count(),
+            ms = t0.elapsed().as_millis() as u64,
+            "vectors loaded"
+        );
+        Ok(engine)
     }
 
-    /// Construct an engine for write-only hooks (precompact, session-end) that
-    /// import a transcript but never search.
-    ///
-    /// Unlike [`Engine::new`], this skips loading the on-disk HNSW cache
-    /// entirely — the `HnswIo::load_hnsw` that walks every point in the graph
-    /// (the "setting number of points …" pass, ~O(corpus)). The in-memory index
-    /// starts empty and, together with the `flush_index` guard, is never dumped,
-    /// so the on-disk cache is left untouched. New embeddings are written to
-    /// SQLite; the next search-constructing process picks them up via the
-    /// additive-backfill path in [`Engine::new`].
-    pub fn new_import_only(db_path: &Path, projects_dir: &Path) -> Result<Self> {
+    /// Open storage and load only the reflection vectors (about 14k, versus
+    /// 900k chunks). For `generate-story`, a short-lived process that only
+    /// searches reflections.
+    pub fn new_reflections_only(db_path: &Path, projects_dir: &Path) -> Result<Self> {
+        let mut engine = Self::new_unloaded(db_path, projects_dir)?;
+        let (reflections, rmax) = load_side(&engine.storage, VectorTable::Reflections)?;
+        *Arc::get_mut(&mut engine.search)
+            .expect("a new engine's search index is not shared yet")
+            .get_mut()
+            .reflections_mut() = reflections;
+        engine.watermarks.reflections.store(rmax, Ordering::Release);
+        engine.vectors_ready.store(true, Ordering::Release);
+        Ok(engine)
+    }
+
+    /// Open storage without loading any vectors. The daemon uses this so it
+    /// can bind its endpoints first and call [`Self::load_vectors`] after.
+    pub fn new_unloaded(db_path: &Path, projects_dir: &Path) -> Result<Self> {
+        tracing::info!(?db_path, "opening storage");
         let storage = Arc::new(Storage::open(db_path)?);
         let embeddings = Arc::new(EmbeddingEngine::new()?);
-        let index_dir = db_path.parent().unwrap_or(Path::new(".")).join("index");
-        // Small empty index: import inserts land here and are discarded on
-        // process exit. Never dumped, so no on-disk cache is touched.
-        let search = SearchEngine::new(IMPORT_ONLY_INDEX_CAPACITY);
-        Ok(Self {
+        let engine = Self::from_parts(
             storage,
             embeddings,
-            search: Arc::new(RwLock::new(search)),
-            projects_dir: projects_dir.to_path_buf(),
-            index_dir,
-            skip_index_persistence: true,
+            Arc::new(RwLock::new(SearchEngine::default())),
+            projects_dir.to_path_buf(),
+        );
+        engine.vectors_ready.store(false, Ordering::Release);
+        Ok(engine)
+    }
+
+    /// Whether the vectors have been loaded (always true except while a
+    /// daemon is starting).
+    pub fn vectors_ready(&self) -> bool {
+        self.vectors_ready.load(Ordering::Acquire)
+    }
+
+    /// Wait up to `limit` for the vectors to finish loading.
+    pub async fn wait_vectors_ready(&self, limit: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        while !self.vectors_ready() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        true
+    }
+
+    /// Replace both vector stores with everything in SQLite.
+    ///
+    /// Holds the search write lock for the whole load. Searches wait for the
+    /// full store instead of seeing a partial one, and an insert or removal
+    /// made meanwhile waits too and lands on the new store, so none is lost.
+    /// The rows are read on a private connection, so storage keeps serving.
+    pub async fn load_vectors(&self) -> Result<()> {
+        let t0 = std::time::Instant::now();
+        let mut idx = self.search.write().await;
+        let storage = self.storage.clone();
+        let (chunks, cmax, reflections, rmax) = tokio::task::spawn_blocking(move || {
+            let (c, cmax) = load_side(&storage, VectorTable::Chunks)?;
+            let (r, rmax) = load_side(&storage, VectorTable::Reflections)?;
+            anyhow::Ok((c, cmax, r, rmax))
         })
+        .await??;
+        *idx.chunks_mut() = chunks;
+        *idx.reflections_mut() = reflections;
+        self.watermarks.chunks.store(cmax, Ordering::Release);
+        self.watermarks.reflections.store(rmax, Ordering::Release);
+        self.vectors_ready.store(true, Ordering::Release);
+        let line = format!(
+            "CSR vectors loaded: chunks={} reflections={} in {}ms",
+            idx.chunk_count(),
+            idx.reflection_count(),
+            t0.elapsed().as_millis()
+        );
+        drop(idx);
+        log_timing(&line);
+        tracing::info!("{line}");
+        Ok(())
+    }
+
+    /// Reload one side from SQLite, holding the write lock as
+    /// [`Self::load_vectors`] does.
+    async fn reload_side(&self, table: VectorTable) -> Result<()> {
+        let mut idx = self.search.write().await;
+        let storage = self.storage.clone();
+        let (store, max) =
+            tokio::task::spawn_blocking(move || load_side(&storage, table)).await??;
+        *side_mut(&mut idx, table) = store;
+        self.watermarks.of(table).store(max, Ordering::Release);
+        Ok(())
+    }
+
+    /// Bring the in-memory stores up to date with rows written by another
+    /// process (a CLI import, for example).
+    ///
+    /// New rows are found by rowid above the watermark. A side whose row count
+    /// still disagrees with SQLite after a short re-check is reloaded whole:
+    /// that only happens when some other process deleted rows, and a reload
+    /// costs about 3 s for 900k chunks.
+    pub async fn sync_vectors(&self) -> Result<VectorSyncReport> {
+        let mut report = VectorSyncReport::default();
+        for table in [VectorTable::Chunks, VectorTable::Reflections] {
+            let added = self.apply_new_rows(table).await?;
+            let mut reloaded = false;
+            if !self.count_matches(table).await? {
+                tokio::time::sleep(COUNT_RECHECK_DELAY).await;
+                self.apply_new_rows(table).await?;
+                if !self.count_matches(table).await? {
+                    self.reload_side(table).await?;
+                    reloaded = true;
+                }
+            }
+            match table {
+                VectorTable::Chunks => {
+                    report.chunks_added = added;
+                    report.chunks_reloaded = reloaded;
+                }
+                VectorTable::Reflections => {
+                    report.reflections_added = added;
+                    report.reflections_reloaded = reloaded;
+                }
+            }
+        }
+        if report.chunks_reloaded || report.reflections_reloaded {
+            log_timing(&format!("CSR vectors resynced: {report:?}"));
+        }
+        Ok(report)
+    }
+
+    async fn apply_new_rows(&self, table: VectorTable) -> Result<usize> {
+        let after = self.watermarks.of(table).load(Ordering::Acquire);
+        let storage = self.storage.clone();
+        let (rows, max) = tokio::task::spawn_blocking(move || {
+            let mut rows: Vec<(String, Vec<f32>)> = Vec::new();
+            let max = storage.stream_vectors_after(table, after, |id, v| {
+                rows.push((id.to_owned(), v.to_vec()));
+            })?;
+            anyhow::Ok((rows, max))
+        })
+        .await??;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut idx = self.search.write().await;
+        let store = side_mut(&mut idx, table);
+        for (id, v) in rows.iter() {
+            store.upsert(id.clone(), v);
+        }
+        self.watermarks.of(table).fetch_max(max, Ordering::AcqRel);
+        Ok(rows.len())
+    }
+
+    async fn count_matches(&self, table: VectorTable) -> Result<bool> {
+        let storage = self.storage.clone();
+        let db = tokio::task::spawn_blocking(move || storage.count_vectors(table)).await??;
+        Ok(side(&*self.search.read().await, table).len() == db)
     }
 
     /// Import conversations from the Claude projects directory.
@@ -298,7 +323,6 @@ impl Engine {
             }
         }
 
-        self.flush_index().await;
         Ok(total)
     }
 
@@ -475,7 +499,6 @@ impl Engine {
                                 enriched,
                                 needing.len()
                             );
-                            self.flush_index().await;
                         }
                     }
                 }
@@ -486,9 +509,6 @@ impl Engine {
                 needing.len()
             );
         }
-
-        // Final flush to persist any remaining vectors
-        self.flush_index().await;
 
         Ok((backfilled, enriched))
     }
@@ -511,261 +531,6 @@ impl Engine {
         &self.projects_dir
     }
 
-    pub fn index_dir(&self) -> &Path {
-        &self.index_dir
-    }
-
-    /// Rebuild the whole HNSW index from the vectors in SQLite, publish it as
-    /// a new compaction epoch, and swap it in as this engine's live index.
-    ///
-    /// hnsw_rs cannot delete, so blanked (tombstoned) slots accumulate until a
-    /// full rebuild. That rebuild takes minutes on a large corpus, so it never
-    /// runs in a foreground `Engine::new`: those leave a `needs_compaction`
-    /// marker, and the daemon's compaction loop (or the explicit
-    /// `rebuild-index` command) calls this.
-    ///
-    /// The stream and the publish run on the blocking pool, outside the live
-    /// index's lock, so searches keep serving the old index meanwhile. Rows
-    /// that land or vanish while the stream runs are reconciled against the
-    /// DB twice: once before publishing, and once more under the write lock
-    /// just before the swap (ids are loaded before taking the lock).
-    ///
-    /// Returns `Ok(None)` when `cancel` is set before the stream finishes:
-    /// nothing is published and the live index is untouched.
-    pub async fn rebuild_search_index(
-        &self,
-        cancel: Option<Arc<AtomicBool>>,
-        scope: CompactionScope,
-    ) -> Result<Option<RebuildReport>> {
-        if scope == CompactionScope::ReflectionsOnly {
-            // A reflection-only compaction keeps this engine's chunk side and
-            // publishes the chunk side already on disk. That is only sound when
-            // both descend from the same compaction; if another process
-            // compacted since this engine loaded, rebuild everything instead.
-            let index_dir = self.index_dir.clone();
-            let disk_epoch = tokio::task::spawn_blocking(move || {
-                crate::search::on_disk_compaction_epoch(&index_dir)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("manifest epoch probe failed: {e}"))?;
-            if disk_epoch <= self.search.read().await.compaction_epoch() {
-                return self.rebuild_reflection_side(cancel).await;
-            }
-            tracing::warn!(
-                disk_epoch,
-                "reflection-only compaction escalated to a full rebuild: a newer compaction is on disk"
-            );
-        }
-        let t_build = std::time::Instant::now();
-        let storage = self.storage.clone();
-        let cancel_build = cancel.clone();
-        let built = tokio::task::spawn_blocking(move || {
-            let Some((mut fresh, chunks, reflections)) =
-                rebuild_search_index_streaming_cancellable(
-                    &storage,
-                    RECONCILE_BATCH,
-                    cancel_build.as_deref(),
-                )?
-            else {
-                return Ok::<_, anyhow::Error>(None);
-            };
-            reconcile_search_with_db(
-                &storage,
-                &mut fresh,
-                storage.load_all_reflection_ids().ok().as_deref(),
-                storage.load_all_chunk_ids().ok().as_deref(),
-            );
-            Ok(Some((fresh, chunks, reflections)))
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("index rebuild task failed: {e}"))??;
-        let Some((mut fresh, chunks, reflections)) = built else {
-            return Ok(None);
-        };
-        if is_cancelled(cancel.as_deref()) {
-            return Ok(None);
-        }
-        let build = t_build.elapsed();
-
-        let t_publish = std::time::Instant::now();
-        if !self.skip_index_persistence {
-            fresh.mark_as_compaction();
-            let storage = self.storage.clone();
-            let index_dir = self.index_dir.clone();
-            fresh = tokio::task::spawn_blocking(move || {
-                let chunk_count = storage.count_chunk_embeddings()?;
-                let reflection_count = storage.count_reflection_embeddings()?;
-                fresh.dump_to_disk(&index_dir, chunk_count, reflection_count)?;
-                Ok::<_, anyhow::Error>(fresh)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("index publish task failed: {e}"))??;
-        }
-        let publish = t_publish.elapsed();
-
-        let storage = self.storage.clone();
-        let (reflection_ids, chunk_ids) = tokio::task::spawn_blocking(move || {
-            (
-                storage.load_all_reflection_ids().ok(),
-                storage.load_all_chunk_ids().ok(),
-            )
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("index id probe task failed: {e}"))?;
-        let epoch = fresh.compaction_epoch();
-        {
-            let mut live = self.search.write().await;
-            reconcile_search_with_db(
-                &self.storage,
-                &mut fresh,
-                reflection_ids.as_deref(),
-                chunk_ids.as_deref(),
-            );
-            *live = fresh;
-        }
-        crate::search::clear_needs_compaction(&self.index_dir);
-        crate::runtime::release_freed_pages();
-        Ok(Some(RebuildReport {
-            chunks,
-            reflections,
-            build,
-            publish,
-            epoch,
-            scope: CompactionScope::Full,
-        }))
-    }
-
-    /// Rebuild only the reflection index from SQLite and swap it into this
-    /// engine, leaving the chunk index exactly as it is. Reflections churn
-    /// (every `stop` hook replaces its session's episode), so they reach the
-    /// tombstone threshold long before chunks do, and rebuilding 13k reflection
-    /// vectors takes seconds where the chunk side takes hours at the daemon's
-    /// background priority. The publish writes the reflection side and carries
-    /// the published chunk side forward.
-    async fn rebuild_reflection_side(
-        &self,
-        cancel: Option<Arc<AtomicBool>>,
-    ) -> Result<Option<RebuildReport>> {
-        let t_build = std::time::Instant::now();
-        let storage = self.storage.clone();
-        let cancel_build = cancel.clone();
-        let built = tokio::task::spawn_blocking(move || {
-            let Some((mut fresh, reflections)) = rebuild_reflections_streaming_cancellable(
-                &storage,
-                RECONCILE_BATCH,
-                cancel_build.as_deref(),
-            )?
-            else {
-                return Ok::<_, anyhow::Error>(None);
-            };
-            reconcile_search_with_db(
-                &storage,
-                &mut fresh,
-                storage.load_all_reflection_ids().ok().as_deref(),
-                None,
-            );
-            Ok(Some((fresh, reflections)))
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("reflection rebuild task failed: {e}"))??;
-        let Some((fresh, reflections)) = built else {
-            return Ok(None);
-        };
-        if is_cancelled(cancel.as_deref()) {
-            return Ok(None);
-        }
-        let build = t_build.elapsed();
-
-        let storage = self.storage.clone();
-        let reflection_ids = tokio::task::spawn_blocking(move || storage.load_all_reflection_ids())
-            .await
-            .map_err(|e| anyhow::anyhow!("reflection id probe task failed: {e}"))?;
-        let t_publish = std::time::Instant::now();
-        let epoch = {
-            let mut live = self.search.write().await;
-            live.replace_reflection_side(fresh);
-            reconcile_search_with_db(
-                &self.storage,
-                &mut live,
-                reflection_ids.ok().as_deref(),
-                None,
-            );
-            if !self.skip_index_persistence {
-                live.mark_as_compaction();
-                let published = self.storage.count_chunk_embeddings().and_then(|chunks| {
-                    let refls = self.storage.count_reflection_embeddings()?;
-                    live.dump_to_disk_scoped(
-                        &self.index_dir,
-                        chunks,
-                        refls,
-                        crate::search::DumpScope::ReflectionsOnly,
-                    )
-                });
-                if let Err(e) = published {
-                    live.cancel_compaction_publish();
-                    return Err(e.context(format!(
-                        "persisting HNSW index to {}",
-                        self.index_dir.display()
-                    )));
-                }
-            }
-            live.compaction_epoch()
-        };
-        let publish = t_publish.elapsed();
-        crate::search::clear_needs_compaction(&self.index_dir);
-        Ok(Some(RebuildReport {
-            chunks: 0,
-            reflections,
-            build,
-            publish,
-            epoch,
-            scope: CompactionScope::ReflectionsOnly,
-        }))
-    }
-
-    /// Flush the HNSW index to disk if it has been modified.
-    /// Safe to call multiple times — skips if not dirty.
-    pub async fn flush_index(&self) {
-        // Write-only engines (import-only hooks) never persist the index. The
-        // in-memory index holds at most this session's chunks against an empty
-        // base; dumping it would overwrite the real on-disk cache with a
-        // near-empty graph carrying a full-count manifest. The next load would
-        // accept it as current and (via the id-backfill in `Engine::new`)
-        // recover only by re-inserting the whole corpus — the expensive rebuild
-        // this path exists to avoid. See `skip_index_persistence`.
-        self.flush_index_scoped(crate::search::DumpScope::Full)
-            .await;
-    }
-
-    /// Persist only the reflection side, carrying the published chunk side
-    /// forward. Used by the `stop` hook: a full flush there rewrote the whole
-    /// 1.7 GB chunk index after nearly every response. Its new chunks are in
-    /// SQLite already; the daemon persists the chunk side on a timer.
-    pub async fn flush_index_reflections_only(&self) {
-        self.flush_index_scoped(crate::search::DumpScope::ReflectionsOnly)
-            .await;
-    }
-
-    async fn flush_index_scoped(&self, scope: crate::search::DumpScope) {
-        if self.skip_index_persistence {
-            return;
-        }
-        let mut idx = self.search.write().await;
-        let due = match scope {
-            crate::search::DumpScope::Full => idx.is_dirty(),
-            crate::search::DumpScope::ReflectionsOnly => idx.is_reflection_dirty(),
-        };
-        if due {
-            // Query current DB counts for staleness-correct manifest
-            let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
-            let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
-            if let Err(e) = idx.dump_to_disk_scoped(&self.index_dir, chunk_count, refl_count, scope)
-            {
-                tracing::warn!(error = %e, "failed to flush HNSW index (non-fatal)");
-            }
-        }
-    }
-
     /// Start the file system watcher as a background task.
     /// Returns a JoinHandle that can be awaited or dropped.
     pub fn start_watcher(&self) -> tokio::task::JoinHandle<()> {
@@ -774,7 +539,6 @@ impl Engine {
             self.storage.clone(),
             self.embeddings.clone(),
             self.search.clone(),
-            self.index_dir.to_path_buf(),
         );
         watcher.spawn()
     }
@@ -804,7 +568,6 @@ impl Engine {
             self.embeddings,
             self.search,
             self.projects_dir,
-            self.index_dir,
         );
         #[cfg(unix)]
         let service = match stdout {
@@ -850,7 +613,6 @@ impl Engine {
             self.embeddings,
             self.search,
             self.projects_dir,
-            self.index_dir,
         );
 
         let listener = crate::mcp::http::bind(addr).await?;
@@ -866,813 +628,173 @@ impl Engine {
     }
 }
 
-/// Batch size for reconciling the HNSW cache against SQLite: both the
-/// additive-drift backfill (missing ids only) and the cache-miss full
-/// rebuild fetch vectors this many ids at a time, so peak transient memory
-/// is O(batch) instead of O(corpus). See src/engine.rs:126-165 history.
-const RECONCILE_BATCH: usize = 2_000;
-
-/// Fetch and insert only the given missing chunk ids, in bounded batches.
-/// Never materializes more than `batch_size` vectors at once. Returns the
-/// number of points actually inserted.
-fn backfill_missing_chunks_batched(
-    storage: &Storage,
-    search: &mut SearchEngine,
-    missing_ids: &[String],
-    batch_size: usize,
-) -> Result<usize> {
-    let mut added = 0;
-    for batch in missing_ids.chunks(batch_size.max(1)) {
-        let vecs = storage.get_chunk_vectors_by_ids(batch)?;
-        added += vecs.len();
-        for (id, vec) in vecs {
-            search.insert_chunk(id, vec);
-        }
-    }
-    Ok(added)
-}
-
-pub(crate) fn backfill_missing_chunks(
-    storage: &Storage,
-    search: &mut SearchEngine,
-    missing_ids: &[String],
-) -> Result<usize> {
-    backfill_missing_chunks_batched(storage, search, missing_ids, RECONCILE_BATCH)
-}
-
-/// Reflection counterpart of [`backfill_missing_chunks_batched`].
-fn backfill_missing_reflections_batched(
-    storage: &Storage,
-    search: &mut SearchEngine,
-    missing_ids: &[String],
-    batch_size: usize,
-) -> Result<usize> {
-    let mut added = 0;
-    for batch in missing_ids.chunks(batch_size.max(1)) {
-        let vecs = storage.get_reflection_vectors_by_ids(batch)?;
-        added += vecs.len();
-        for (id, vec) in vecs {
-            search.insert_reflection(id, vec);
-        }
-    }
-    Ok(added)
-}
-
-fn backfill_missing_reflections(
-    storage: &Storage,
-    search: &mut SearchEngine,
-    missing_ids: &[String],
-) -> Result<usize> {
-    backfill_missing_reflections_batched(storage, search, missing_ids, RECONCILE_BATCH)
-}
-
-/// Reconcile a loaded or freshly rebuilt index with the DB ids: blank ids the
-/// DB no longer has and backfill ids the index lacks, for both sides. Returns
-/// how many entries were backfilled. A side whose id probe failed (`None`) is
-/// left as it is.
-fn reconcile_search_with_db(
-    storage: &Storage,
-    search: &mut SearchEngine,
-    db_reflection_ids: Option<&[String]>,
-    db_chunk_ids: Option<&[String]>,
-) -> usize {
-    let mut backfill_added = 0usize;
-    if let Some(db_ids) = db_reflection_ids {
-        let db_id_set: std::collections::HashSet<&str> =
-            db_ids.iter().map(|s| s.as_str()).collect();
-        let blanked = search.blank_orphan_reflections(&db_id_set);
-        if blanked > 0 {
-            tracing::info!(blanked, "blanked orphan reflection entries in HNSW cache");
-        }
-
-        // Backfill reflections that exist in DB but not in HNSW.
-        // Fetch only the missing ids, in bounded batches — never the
-        // whole reflection table.
-        let missing: Vec<String> = db_id_set
-            .iter()
-            .filter(|id| !search.has_reflection(id))
-            .map(|s| s.to_string())
-            .collect();
-        if !missing.is_empty() {
-            if let Ok(added) = backfill_missing_reflections(storage, search, &missing) {
-                if added > 0 {
-                    tracing::info!(added, "backfilled missing reflections into HNSW cache");
-                }
-                backfill_added += added;
-            }
-        }
-    }
-
-    // Backfill chunks added to DB since the last dump (additive drift).
-    // Cheap ID probe first; only fetch the vectors that are actually
-    // missing (in bounded batches) if something is missing. This is what
-    // lets a stale-but-additive cache load in ~ms instead of triggering a
-    // full HNSW rebuild (~tens of seconds), while keeping peak transient
-    // memory O(batch) rather than O(corpus).
-    if let Some(db_chunk_ids) = db_chunk_ids {
-        let missing: Vec<String> = db_chunk_ids
-            .iter()
-            .filter(|id| !search.has_chunk(id))
-            .cloned()
-            .collect();
-        let mut chunks_added = 0usize;
-        if !missing.is_empty() {
-            if let Ok(added) = backfill_missing_chunks(storage, search, &missing) {
-                if added > 0 {
-                    tracing::info!(added, "backfilled missing chunks into HNSW cache");
-                }
-                chunks_added = added;
-                backfill_added += added;
-            }
-        }
-        // Blank chunks the DB has deleted since the last dump (negative
-        // drift; `load_from_disk` no longer rebuilds for it). After the
-        // backfill, the DB ids live in the index number
-        // `db - missing + added`, so a larger live count means the cache
-        // holds orphans. The O(1) gate keeps the common no-orphan load
-        // from building a corpus-sized id set on every hook.
-        let db_ids_live = db_chunk_ids.len() - missing.len() + chunks_added;
-        if search.live_chunk_count() > db_ids_live {
-            let db_id_set: std::collections::HashSet<&str> =
-                db_chunk_ids.iter().map(|s| s.as_str()).collect();
-            let blanked = search.blank_orphan_chunks(&db_id_set);
-            if blanked > 0 {
-                tracing::info!(blanked, "blanked orphan chunk entries in HNSW cache");
-            }
-        }
-    }
-    backfill_added
-}
-
-/// Rebuild the HNSW index from SQLite, streaming vectors in bounded batches
-/// instead of materializing `load_all_chunk_vectors()` (the whole corpus) as
-/// one `Vec<(String, Vec<f32>)>` before inserting. Cheap id probes
-/// (`load_all_chunk_ids` / `load_all_reflection_ids`) drive the batching;
-/// each batch's vectors are moved (not cloned) into the index and dropped
-/// before the next batch is fetched. Returns the built index plus the
-/// (chunks, reflections) counts actually inserted.
-fn rebuild_search_index_streaming(
-    storage: &Storage,
-    batch_size: usize,
-) -> Result<(SearchEngine, usize, usize)> {
-    rebuild_search_index_streaming_cancellable(storage, batch_size, None)?
-        .ok_or_else(|| anyhow::anyhow!("index rebuild cancelled"))
-}
-
-fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
-    cancel.is_some_and(|flag| flag.load(Ordering::SeqCst))
-}
-
-/// [`rebuild_search_index_streaming`] that checks `cancel` before every batch
-/// and returns `Ok(None)` once it is set, so a shutdown waits for at most one
-/// batch instead of a whole multi-minute rebuild.
-fn rebuild_search_index_streaming_cancellable(
-    storage: &Storage,
-    batch_size: usize,
-    cancel: Option<&AtomicBool>,
-) -> Result<Option<(SearchEngine, usize, usize)>> {
-    let chunk_ids = storage.load_all_chunk_ids()?;
-    let reflection_ids = storage.load_all_reflection_ids()?;
-
-    let estimated_size = (chunk_ids.len() + 1000).max(10_000);
-    let mut search = SearchEngine::new(estimated_size);
-
-    let mut chunk_total = 0usize;
-    for batch in chunk_ids.chunks(batch_size.max(1)) {
-        if is_cancelled(cancel) {
-            return Ok(None);
-        }
-        let vecs = storage.get_chunk_vectors_by_ids(batch)?;
-        chunk_total += vecs.len();
-        for (id, vec) in vecs {
-            search.insert_chunk(id, vec);
-        }
-    }
-
-    let mut reflection_total = 0usize;
-    for batch in reflection_ids.chunks(batch_size.max(1)) {
-        if is_cancelled(cancel) {
-            return Ok(None);
-        }
-        let vecs = storage.get_reflection_vectors_by_ids(batch)?;
-        reflection_total += vecs.len();
-        for (id, vec) in vecs {
-            search.insert_reflection(id, vec);
-        }
-    }
-
-    Ok(Some((search, chunk_total, reflection_total)))
-}
-
-/// What [`Engine::rebuild_search_index`] built and how long each phase took.
-#[derive(Debug, Clone, Copy)]
-pub struct RebuildReport {
-    pub chunks: usize,
-    pub reflections: usize,
-    /// Streaming the vectors out of SQLite into a new HNSW graph.
-    pub build: std::time::Duration,
-    /// Writing the new generation and manifest under the exclusive index lock.
-    pub publish: std::time::Duration,
-    /// The compaction epoch the new manifest carries.
-    pub epoch: u64,
-    /// Which sides were rebuilt. `chunks` is 0 for a reflection-only rebuild.
-    pub scope: CompactionScope,
-}
-
-/// Which sides of the index a compaction rebuilds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompactionScope {
-    /// Both sides, from the whole of SQLite.
-    Full,
-    /// The reflection side only; the chunk side is kept as it is.
-    ReflectionsOnly,
-}
-
-/// Rebuild only the reflection side from SQLite, in bounded batches, checking
-/// `cancel` before each one. The returned engine's chunk side is empty and
-/// unused: callers transplant its reflection side with
-/// [`SearchEngine::replace_reflection_side`].
-fn rebuild_reflections_streaming_cancellable(
-    storage: &Storage,
-    batch_size: usize,
-    cancel: Option<&AtomicBool>,
-) -> Result<Option<(SearchEngine, usize)>> {
-    let reflection_ids = storage.load_all_reflection_ids()?;
-    // SearchEngine::new sizes the reflection index at a tenth of its argument.
-    let mut search = SearchEngine::new(((reflection_ids.len() + 1000) * 10).max(10_000));
-    let mut total = 0usize;
-    for batch in reflection_ids.chunks(batch_size.max(1)) {
-        if is_cancelled(cancel) {
-            return Ok(None);
-        }
-        let vecs = storage.get_reflection_vectors_by_ids(batch)?;
-        total += vecs.len();
-        for (id, vec) in vecs {
-            search.insert_reflection(id, vec);
-        }
-    }
-    Ok(Some((search, total)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::import::ConversationChunk;
     use crate::provenance::Speaker;
 
-    fn insert_test_chunk(storage: &Storage, id: &str) {
-        storage
-            .insert_chunk(
-                &ConversationChunk {
-                    id: id.into(),
-                    conversation_id: "conv".into(),
-                    project_name: "proj".into(),
-                    timestamp: "2026-09-08T00:00:00Z".into(),
-                    content: "x".into(),
-                    message_count: 1,
-                    summary: None,
-                    author: Speaker::User,
-                    seq: 0,
-                    is_sidechain: false,
-                },
-                &[0.1_f32; 384],
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn backfill_missing_chunks_inserts_exactly_the_missing_ids_in_batches() {
-        let storage = Storage::open_memory().unwrap();
-        for i in 0..10 {
-            insert_test_chunk(&storage, &format!("chunk-{i}"));
-        }
-        let mut search = SearchEngine::new(100);
-        // Pre-seed half of them as already-present — these must be skipped,
-        // not re-fetched (proves we fetch only the missing ids, not the corpus).
-        for i in 0..5 {
-            search.insert_chunk(format!("chunk-{i}"), vec![0.1_f32; 384]);
-        }
-
-        let db_ids = storage.load_all_chunk_ids().unwrap();
-        let missing: Vec<String> = db_ids
-            .into_iter()
-            .filter(|id| !search.has_chunk(id))
-            .collect();
-        assert_eq!(missing.len(), 5, "sanity: half should be missing");
-
-        // batch_size=2 over 5 missing ids forces 3 separate batched lookups
-        // (2, 2, 1) — exercises the bounded-batch path, not a single big fetch.
-        let added = backfill_missing_chunks_batched(&storage, &mut search, &missing, 2).unwrap();
-
-        assert_eq!(
-            added, 5,
-            "must insert exactly the missing ids, not the whole corpus"
-        );
-        for i in 5..10 {
-            assert!(search.has_chunk(&format!("chunk-{i}")));
+    fn chunk(id: &str) -> ConversationChunk {
+        ConversationChunk {
+            id: id.into(),
+            conversation_id: "conv".into(),
+            project_name: "proj".into(),
+            timestamp: "2026-09-08T00:00:00Z".into(),
+            content: format!("content {id}"),
+            message_count: 1,
+            summary: None,
+            author: Speaker::User,
+            seq: 0,
+            is_sidechain: false,
         }
     }
 
-    #[test]
-    fn backfill_missing_reflections_inserts_exactly_the_missing_ids_in_batches() {
-        let storage = Storage::open_memory().unwrap();
-        for i in 0..7 {
-            storage
-                .insert_reflection(&format!("refl-{i}"), "content", &[], &[0.2_f32; 384])
-                .unwrap();
-        }
-        let mut search = SearchEngine::new(100);
-        for i in 0..3 {
-            search.insert_reflection(format!("refl-{i}"), vec![0.2_f32; 384]);
-        }
-
-        let db_ids = storage.load_all_reflection_ids().unwrap();
-        let missing: Vec<String> = db_ids
-            .into_iter()
-            .filter(|id| !search.has_reflection(id))
-            .collect();
-        assert_eq!(missing.len(), 4, "sanity: 4 should be missing");
-
-        let added =
-            backfill_missing_reflections_batched(&storage, &mut search, &missing, 3).unwrap();
-
-        assert_eq!(added, 4);
-        for i in 3..7 {
-            assert!(search.has_reflection(&format!("refl-{i}")));
-        }
+    fn vec_for(i: usize) -> Vec<f32> {
+        let mut v = vec![0.01_f32; 384];
+        v[i % 384] = 1.0;
+        v
     }
 
-    #[test]
-    fn rebuild_search_index_streaming_inserts_all_corpus_points_via_batches() {
-        let storage = Storage::open_memory().unwrap();
-        for i in 0..7 {
-            insert_test_chunk(&storage, &format!("chunk-{i}"));
-        }
-        for i in 0..3 {
-            storage
-                .insert_reflection(&format!("refl-{i}"), "content", &[], &[0.2_f32; 384])
-                .unwrap();
-        }
-
-        // batch_size=2 forces multiple batches for both chunks (7) and
-        // reflections (3) — proves the rebuild path never needs a single
-        // corpus-sized fetch to produce a correct index.
-        let (search, chunk_total, reflection_total) =
-            rebuild_search_index_streaming(&storage, 2).unwrap();
-
-        assert_eq!(chunk_total, 7);
-        assert_eq!(reflection_total, 3);
-        for i in 0..7 {
-            assert!(search.has_chunk(&format!("chunk-{i}")));
-        }
-        for i in 0..3 {
-            assert!(search.has_reflection(&format!("refl-{i}")));
-        }
-    }
-
-    fn insert_test_chunk_in(storage: &Storage, id: &str, conversation_id: &str) {
-        storage
-            .insert_chunk(
-                &ConversationChunk {
-                    id: id.into(),
-                    conversation_id: conversation_id.into(),
-                    project_name: "proj".into(),
-                    timestamp: "2026-09-08T00:00:00Z".into(),
-                    content: "x".into(),
-                    message_count: 1,
-                    summary: None,
-                    author: Speaker::User,
-                    seq: 0,
-                    is_sidechain: false,
-                },
-                &[0.1_f32; 384],
-            )
-            .unwrap();
-    }
-
-    /// The DB can hold fewer rows than the published manifest describes: plan
-    /// reimport deletes before it re-embeds, reflection supersession deletes the
-    /// old layer, and a manifest's counts are captured independently of the
-    /// in-memory id maps, so a concurrent insert-then-delete can land between
-    /// them. Every process that constructed an engine inside that window used to
-    /// rebuild the whole corpus (805k vectors on a real install: minutes of CPU
-    /// per hook, 20+ stacked hooks, none finishing). It must instead reuse the
-    /// cache and blank the vanished ids.
-    #[tokio::test]
-    async fn negative_drift_reuses_cache_and_blanks_orphans_instead_of_rebuilding() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let db_path = tmp.path().join("test.db");
-        let projects_dir = tmp.path().join("projects");
-        std::fs::create_dir_all(&projects_dir).unwrap();
-        let index_dir = tmp.path().join("index");
-
-        {
-            let storage = Storage::open(&db_path).unwrap();
-            for i in 0..10 {
-                insert_test_chunk_in(&storage, &format!("keep-{i}"), "conv-keep");
-            }
-            for i in 0..2 {
-                insert_test_chunk_in(&storage, &format!("gone-{i}"), "plan:gone");
-            }
-            for i in 0..3 {
-                storage
-                    .insert_reflection(&format!("refl-{i}"), "content", &[], &[0.2_f32; 384])
-                    .unwrap();
-            }
-        }
-
-        // No cache yet: the first construction builds one and publishes it.
-        drop(Engine::new(&db_path, &projects_dir).unwrap());
-        let manifest_before = std::fs::read(index_dir.join("manifest.json"))
-            .expect("first Engine::new must publish a manifest");
-
-        // Rows vanish after the manifest was published.
-        {
-            let storage = Storage::open(&db_path).unwrap();
-            storage.delete_chunks_for_conversation("plan:gone").unwrap();
-            storage.delete_reflection("refl-0").unwrap();
-        }
-
-        let eng = Engine::new(&db_path, &projects_dir).unwrap();
-
-        // Receipt that the cache was reused: the rebuild path always publishes
-        // a new manifest (new generation basename, new created_at).
-        let manifest_after = std::fs::read(index_dir.join("manifest.json")).unwrap();
-        assert!(
-            manifest_before == manifest_after,
-            "negative drift must reuse the published cache, not rebuild and republish it"
-        );
-
-        let search = eng.search.read().await;
-        for i in 0..2 {
-            assert!(
-                !search.has_chunk(&format!("gone-{i}")),
-                "a chunk deleted from the DB must be blanked on load"
-            );
-        }
-        for i in 0..10 {
-            assert!(search.has_chunk(&format!("keep-{i}")));
-        }
-        assert!(
-            !search.has_reflection("refl-0"),
-            "a reflection deleted from the DB must be blanked on load"
-        );
-        assert!(search.has_reflection("refl-1") && search.has_reflection("refl-2"));
-        assert_eq!(search.reflection_count(), 2);
-
-        let hits = search.search_chunks(&[0.1_f32; 384], 20, 0.0);
-        assert!(
-            hits.iter().all(|h| !h.id.starts_with("gone-")),
-            "blanked chunks must never be returned by search"
-        );
-        assert_eq!(hits.len(), 10, "every live chunk is still returned");
-    }
-
-    /// Temp DB + projects dir; the index lives at `<tmp>/index`, beside the DB,
-    /// exactly where `Engine::new` derives it.
     struct Corpus {
         _tmp: tempfile::TempDir,
-        db_path: std::path::PathBuf,
-        projects_dir: std::path::PathBuf,
-        index_dir: std::path::PathBuf,
+        db: PathBuf,
+        projects: PathBuf,
     }
 
     impl Corpus {
         fn new() -> Self {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let db_path = tmp.path().join("test.db");
-            let projects_dir = tmp.path().join("projects");
-            std::fs::create_dir_all(&projects_dir).unwrap();
-            let index_dir = tmp.path().join("index");
+            let tmp = tempfile::tempdir().unwrap();
+            let db = tmp.path().join("csr-engine.db");
+            let projects = tmp.path().join("projects");
+            std::fs::create_dir_all(&projects).unwrap();
             Self {
                 _tmp: tmp,
-                db_path,
-                projects_dir,
-                index_dir,
+                db,
+                projects,
             }
         }
 
-        fn seed(&self, conversation_id: &str, prefix: &str, n: usize) {
-            let storage = Storage::open(&self.db_path).unwrap();
-            for i in 0..n {
-                insert_test_chunk_in(&storage, &format!("{prefix}-{i}"), conversation_id);
-            }
+        fn storage(&self) -> Storage {
+            Storage::open(&self.db).unwrap()
         }
+    }
 
-        fn delete_conversation(&self, conversation_id: &str) {
-            Storage::open(&self.db_path)
-                .unwrap()
-                .delete_chunks_for_conversation(conversation_id)
+    #[tokio::test]
+    async fn new_loads_every_vector_from_sqlite_and_finds_them() {
+        let c = Corpus::new();
+        let s = c.storage();
+        for i in 0..40 {
+            s.insert_chunk(&chunk(&format!("c{i}")), &vec_for(i))
                 .unwrap();
         }
-
-        fn engine(&self) -> Engine {
-            Engine::new(&self.db_path, &self.projects_dir).unwrap()
-        }
-
-        fn manifest_bytes(&self) -> Vec<u8> {
-            std::fs::read(self.index_dir.join("manifest.json")).unwrap()
-        }
-    }
-
-    #[tokio::test]
-    async fn engine_new_marks_compaction_only_once_tombstones_are_material() {
-        let c = Corpus::new();
-        c.seed("conv-keep", "keep", 39);
-        c.seed("plan:one", "one", 1);
-        c.seed("plan:four", "four", 4);
-        drop(c.engine()); // no cache yet: builds and publishes one (44 slots)
-
-        // 1 blank of 44 slots is under the 1-in-20 threshold.
-        c.delete_conversation("plan:one");
-        drop(c.engine());
-        assert!(
-            !crate::search::needs_compaction(&c.index_dir),
-            "a non-material tombstone share must not request a compaction"
-        );
-
-        // 5 of 44 is over it. Engine::new never flushes, so the published
-        // manifest still lists every id and both deletions blank here.
-        c.delete_conversation("plan:four");
-        drop(c.engine());
-        assert!(
-            crate::search::needs_compaction(&c.index_dir),
-            "a material tombstone share must request a compaction"
-        );
-    }
-
-    /// The reason the compaction guard exists: a process that loaded the index
-    /// before a compaction must not publish its pre-compaction maps over the
-    /// compacted ones afterward. Without the guard it puts every blank slot
-    /// back, the next load requests another compaction, and the daemon
-    /// rebuilds the whole corpus again.
-    #[tokio::test]
-    async fn compaction_survives_a_process_that_loaded_the_pre_compaction_index() {
-        let c = Corpus::new();
-        c.seed("conv-keep", "keep", 10);
-        c.seed("plan:gone", "gone", 30);
-        drop(c.engine());
-
-        c.delete_conversation("plan:gone");
-        let stale = c.engine(); // loads 40 slots, blanks 30: material
-        assert!(crate::search::needs_compaction(&c.index_dir));
-
-        let report = c
-            .engine()
-            .rebuild_search_index(None, CompactionScope::Full)
-            .await
-            .unwrap()
-            .expect("an uncancelled rebuild completes");
-        assert_eq!(report.chunks, 10);
-        assert!(
-            !crate::search::needs_compaction(&c.index_dir),
-            "a completed compaction clears the marker"
-        );
-        let compacted = crate::search::on_disk_tombstones(&c.index_dir).unwrap();
-        assert_eq!(compacted.chunk_blank, 0);
-        assert_eq!(compacted.chunk_slots, 10);
-
-        // The stale process saves (its blanking left it dirty).
-        stale.flush_index().await;
-        let after = crate::search::on_disk_tombstones(&c.index_dir).unwrap();
-        assert_eq!(
-            (after.chunk_blank, after.chunk_slots),
-            (0, 10),
-            "a process that loaded the pre-compaction index must not republish its tombstones"
-        );
-
-        drop(c.engine());
-        assert!(
-            !crate::search::needs_compaction(&c.index_dir),
-            "the next load must not request another compaction"
-        );
-    }
-
-    #[tokio::test]
-    async fn cancelled_rebuild_publishes_nothing_and_keeps_the_live_index() {
-        let c = Corpus::new();
-        c.seed("conv-keep", "keep", 10);
-        let eng = c.engine();
-        crate::search::mark_needs_compaction(&c.index_dir);
-        let before = c.manifest_bytes();
-
-        let cancel = Arc::new(AtomicBool::new(true));
-        assert!(eng
-            .rebuild_search_index(Some(cancel), CompactionScope::Full)
-            .await
-            .unwrap()
-            .is_none());
-
-        assert!(
-            c.manifest_bytes() == before,
-            "a cancelled rebuild must not publish"
-        );
-        assert!(
-            crate::search::needs_compaction(&c.index_dir),
-            "a cancelled rebuild leaves the request for the next pass"
-        );
-        assert_eq!(eng.search.read().await.live_chunk_count(), 10);
-    }
-
-    /// A rebuild swaps in an index that also holds rows imported while it ran:
-    /// the reconcile passes backfill from SQLite whatever the stream missed.
-    #[tokio::test]
-    async fn rebuild_swaps_in_rows_the_live_index_took_after_the_stream() {
-        let c = Corpus::new();
-        c.seed("conv-keep", "keep", 10);
-        let eng = c.engine();
-        // Lands in SQLite after the engine loaded; a rebuild must pick it up.
-        c.seed("conv-late", "late", 3);
-        let report = eng
-            .rebuild_search_index(None, CompactionScope::Full)
-            .await
-            .unwrap()
+        s.insert_reflection("r1", "insight", &["t".into()], &vec_for(7))
             .unwrap();
-        assert_eq!(report.chunks, 13);
-        let live = eng.search.read().await;
-        for i in 0..3 {
-            assert!(live.has_chunk(&format!("late-{i}")));
-        }
-        assert_eq!(live.tombstones().chunk_blank, 0);
+        drop(s);
+
+        let e = Engine::new(&c.db, &c.projects).unwrap();
+        let idx = e.search().read().await;
+        assert_eq!(idx.chunk_count(), 40);
+        assert_eq!(idx.reflection_count(), 1);
+        assert_eq!(idx.search_chunks(&vec_for(13), 1, 0.5)[0].id, "c13");
+        assert_eq!(idx.search_reflections(&vec_for(7), 1, 0.5)[0].id, "r1");
     }
 
     #[tokio::test]
-    async fn compaction_tick_rebuilds_only_a_marked_and_still_material_index() {
-        use crate::daemon::{compaction_tick, CompactionOutcome};
+    async fn load_vectors_fills_an_unloaded_engine() {
         let c = Corpus::new();
-        c.seed("conv-keep", "keep", 10);
-        c.seed("plan:gone", "gone", 30);
-        let shutdown = Arc::new(AtomicBool::new(false));
-
-        let eng = c.engine();
-        assert!(matches!(
-            compaction_tick(&eng, &shutdown).await,
-            CompactionOutcome::NoMarker
-        ));
-
-        // A marker over a published index that is not material: cleared, no rebuild.
-        crate::search::mark_needs_compaction(&c.index_dir);
-        let before = c.manifest_bytes();
-        assert!(matches!(
-            compaction_tick(&eng, &shutdown).await,
-            CompactionOutcome::StaleMarkerCleared(_)
-        ));
-        assert!(!crate::search::needs_compaction(&c.index_dir));
-        assert!(
-            c.manifest_bytes() == before,
-            "a stale marker must not rebuild"
-        );
-
-        // Material and marked: rebuilt and cleared. A stop hook's save makes
-        // the blanks part of the published index, as it does on a real install.
-        c.delete_conversation("plan:gone");
-        let hook = c.engine();
-        assert!(crate::search::needs_compaction(&c.index_dir));
-        hook.flush_index().await;
-        match compaction_tick(&eng, &shutdown).await {
-            CompactionOutcome::Rebuilt(report) => assert_eq!(report.chunks, 10),
-            other => panic!("expected a rebuild, got {other:?}"),
-        }
-        assert!(!crate::search::needs_compaction(&c.index_dir));
-        assert_eq!(
-            crate::search::on_disk_tombstones(&c.index_dir)
-                .unwrap()
-                .chunk_blank,
-            0
-        );
-    }
-    fn seed_reflections(c: &Corpus, prefix: &str, n: usize) {
-        let storage = Storage::open(&c.db_path).unwrap();
-        for i in 0..n {
-            storage
-                .insert_reflection(&format!("{prefix}-{i}"), "content", &[], &[0.2_f32; 384])
+        let s = c.storage();
+        for i in 0..10 {
+            s.insert_chunk(&chunk(&format!("c{i}")), &vec_for(i))
                 .unwrap();
         }
+        drop(s);
+        let e = Engine::new_unloaded(&c.db, &c.projects).unwrap();
+        assert_eq!(e.search().read().await.chunk_count(), 0);
+        e.load_vectors().await.unwrap();
+        assert_eq!(e.search().read().await.chunk_count(), 10);
     }
 
-    fn manifest_json(c: &Corpus) -> serde_json::Value {
-        serde_json::from_slice(&c.manifest_bytes()).unwrap()
-    }
-
-    fn chunk_file_stamp(c: &Corpus) -> (std::time::SystemTime, u64) {
-        let basename = manifest_json(c)["chunk_basename"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let meta = std::fs::metadata(c.index_dir.join(format!("{basename}.hnsw.data"))).unwrap();
-        (meta.modified().unwrap(), meta.len())
-    }
-
-    /// The `stop` hook saves reflections only: its new chunks are in SQLite,
-    /// and rewriting the whole chunk index after every response was most of
-    /// the disk traffic. The daemon's periodic full save picks the chunks up.
     #[tokio::test]
-    async fn stop_hook_flush_writes_reflections_and_leaves_the_chunk_index_alone() {
+    async fn sync_picks_up_rows_another_process_wrote() {
         let c = Corpus::new();
-        c.seed("conv-keep", "keep", 10);
-        seed_reflections(&c, "refl", 2);
-        drop(c.engine());
-        let before = manifest_json(&c);
-        let stamp = chunk_file_stamp(&c);
-
-        c.seed("conv-late", "late", 3);
-        seed_reflections(&c, "late-refl", 1);
-        let hook = c.engine(); // backfills both: chunk and reflection sides dirty
-        hook.flush_index_reflections_only().await;
-
-        let after = manifest_json(&c);
-        assert_eq!(after["chunk_basename"], before["chunk_basename"]);
-        assert_eq!(after["chunk_id_map"], before["chunk_id_map"]);
-        assert_eq!(
-            chunk_file_stamp(&c),
-            stamp,
-            "the chunk index file must not be rewritten"
-        );
-        let reflections: Vec<String> =
-            serde_json::from_value(after["reflection_id_map"].clone()).unwrap();
-        assert!(reflections.contains(&"late-refl-0".to_string()));
-
-        // A full flush (the daemon's periodic save) writes the chunk side.
-        hook.flush_index().await;
-        assert_eq!(
-            crate::search::on_disk_tombstones(&c.index_dir)
-                .unwrap()
-                .chunk_slots,
-            13
-        );
-    }
-
-    /// Reflections churn and reach the threshold long before chunks do. A
-    /// compaction triggered by them rebuilds the reflection side only and
-    /// leaves the (large) chunk index files untouched.
-    #[tokio::test]
-    async fn reflection_churn_compacts_only_the_reflection_side() {
-        use crate::daemon::{compaction_tick, CompactionOutcome};
-        let c = Corpus::new();
-        c.seed("conv-keep", "keep", 10);
-        seed_reflections(&c, "refl", 40);
-        let eng = c.engine(); // cache miss: publishes epoch 1
-        let before = manifest_json(&c);
-        let stamp = chunk_file_stamp(&c);
-
-        {
-            let storage = Storage::open(&c.db_path).unwrap();
-            for i in 0..30 {
-                storage.delete_reflection(&format!("refl-{i}")).unwrap();
-            }
+        let e = Engine::new(&c.db, &c.projects).unwrap();
+        let other = c.storage();
+        for i in 0..5 {
+            other
+                .insert_chunk(&chunk(&format!("late{i}")), &vec_for(100 + i))
+                .unwrap();
         }
-        let hook = c.engine(); // 30 of 40 reflection slots blank: marks
-        assert!(crate::search::needs_compaction(&c.index_dir));
-        hook.flush_index_reflections_only().await; // publishes the blanks, as stop does
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        match compaction_tick(&eng, &shutdown).await {
-            CompactionOutcome::Rebuilt(report) => {
-                assert_eq!(report.scope, CompactionScope::ReflectionsOnly);
-                assert_eq!(report.reflections, 10);
-                assert_eq!(report.chunks, 0);
-            }
-            other => panic!("expected a reflection-only rebuild, got {other:?}"),
-        }
-
-        let after = manifest_json(&c);
-        assert_eq!(
-            after["chunk_basename"], before["chunk_basename"],
-            "a reflection-only compaction must not write a chunk generation"
-        );
-        assert_eq!(chunk_file_stamp(&c), stamp);
-        let t = crate::search::on_disk_tombstones(&c.index_dir).unwrap();
-        assert_eq!((t.reflection_blank, t.reflection_slots), (0, 10));
-        assert_eq!((t.chunk_blank, t.chunk_slots), (0, 10));
-        assert_eq!(after["compaction_epoch"], 2);
-        assert!(!crate::search::needs_compaction(&c.index_dir));
-
-        let live = eng.search.read().await;
-        assert_eq!(live.reflection_count(), 10);
-        assert_eq!(live.live_chunk_count(), 10);
-        assert!(!live.has_reflection("refl-0"));
-        assert!(live.has_reflection("refl-39"));
-    }
-
-    /// A reflection-only compaction keeps this engine's chunk side, which is
-    /// only sound if no other process compacted since this engine loaded.
-    #[tokio::test]
-    async fn reflection_only_compaction_escalates_when_a_newer_compaction_is_on_disk() {
-        let c = Corpus::new();
-        c.seed("conv-keep", "keep", 10);
-        seed_reflections(&c, "refl", 4);
-        let eng = c.engine(); // epoch 1
-        c.engine()
-            .rebuild_search_index(None, CompactionScope::Full)
-            .await
-            .unwrap()
-            .unwrap(); // epoch 2, by another process
-        let report = eng
-            .rebuild_search_index(None, CompactionScope::ReflectionsOnly)
-            .await
-            .unwrap()
+        other
+            .insert_reflection("r-late", "x", &[], &vec_for(3))
             .unwrap();
-        assert_eq!(report.scope, CompactionScope::Full);
-        assert_eq!(report.epoch, 3);
+        let report = e.sync_vectors().await.unwrap();
+        assert_eq!(report.chunks_added, 5);
+        assert_eq!(report.reflections_added, 1);
+        assert!(!report.chunks_reloaded && !report.reflections_reloaded);
+        let idx = e.search().read().await;
+        assert_eq!(idx.search_chunks(&vec_for(102), 1, 0.5)[0].id, "late2");
+        drop(idx);
+        assert!(
+            !e.sync_vectors().await.unwrap().changed(),
+            "second sync finds nothing new"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_reloads_a_side_after_another_process_deletes_rows() {
+        let c = Corpus::new();
+        let s = c.storage();
+        for i in 0..6 {
+            s.insert_reflection(&format!("r{i}"), "x", &[], &vec_for(i))
+                .unwrap();
+        }
+        drop(s);
+        let e = Engine::new(&c.db, &c.projects).unwrap();
+        let other = c.storage();
+        other.delete_reflection("r2").unwrap();
+        let report = e.sync_vectors().await.unwrap();
+        assert!(report.reflections_reloaded);
+        let idx = e.search().read().await;
+        assert_eq!(idx.reflection_count(), 5);
+        assert!(!idx.has_reflection("r2"));
+    }
+
+    #[tokio::test]
+    async fn writes_racing_a_load_are_never_lost() {
+        // Production writers write SQLite first and then the store. Whichever
+        // side of the load's lock they land on, the row must end up loaded.
+        for round in 0..20 {
+            let c = Corpus::new();
+            let s = Arc::new(c.storage());
+            for i in 0..50 {
+                s.insert_chunk(&chunk(&format!("c{i}")), &vec_for(i))
+                    .unwrap();
+            }
+            let e = Engine::new_unloaded(&c.db, &c.projects).unwrap();
+            let loader = {
+                let e = e.clone();
+                tokio::spawn(async move { e.load_vectors().await })
+            };
+            let writer = {
+                let e = e.clone();
+                tokio::spawn(async move {
+                    if round % 2 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    e.storage()
+                        .insert_chunk(&chunk("racer"), &vec_for(300))
+                        .unwrap();
+                    e.search()
+                        .write()
+                        .await
+                        .insert_chunk("racer".into(), vec_for(300));
+                })
+            };
+            loader.await.unwrap().unwrap();
+            writer.await.unwrap();
+            let idx = e.search().read().await;
+            assert!(idx.has_chunk("racer"), "round {round}: racing write lost");
+            assert_eq!(idx.chunk_count(), 51);
+        }
     }
 }

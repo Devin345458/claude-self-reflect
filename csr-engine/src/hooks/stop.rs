@@ -449,9 +449,12 @@ pub async fn store_episode(engine: &Engine, episode: &Episode) -> Result<()> {
         .storage()
         .get_reflections_by_tag(&conv_tag, 10)
         .unwrap_or_default();
+    let mut replaced: Vec<String> = Vec::new();
     for (id, _content, existing_tags, _ts) in &existing {
-        if existing_tags.iter().any(|t| t == "session_episode") {
-            let _ = engine.storage().delete_reflection(id);
+        if existing_tags.iter().any(|t| t == "session_episode")
+            && engine.storage().delete_reflection(id).is_ok()
+        {
+            replaced.push(id.clone());
         }
     }
 
@@ -470,9 +473,13 @@ pub async fn store_episode(engine: &Engine, episode: &Episode) -> Result<()> {
         .storage()
         .insert_reflection(&id, &content, &tags, &embedding)?;
 
-    // Also insert into the in-memory search index
+    // Mirror both changes in the in-memory store, so the replaced episode
+    // stops matching searches now rather than at the next reload.
     {
         let mut idx = engine.search().write().await;
+        for old in &replaced {
+            idx.remove_reflection(old);
+        }
         idx.insert_reflection(id, embedding);
     }
 
@@ -555,7 +562,7 @@ pub async fn extract_and_store_episode(
     // Proposals only — never verdicts (see Storage::insert_resolution_proposal).
     // Kill switch mirrors the narrative one. Fail-soft: proposal errors never
     // block the Stop hook.
-    if std::env::var("CSR_NO_TASK_RESOLUTION").is_err() {
+    if super::context::env_var("CSR_NO_TASK_RESOLUTION").is_none() {
         propose_task_resolutions(engine.storage(), &episode.todos, project_name, session_id);
     }
 

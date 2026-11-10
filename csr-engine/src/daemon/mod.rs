@@ -1,18 +1,22 @@
-//! Daemon module — background processing for progressive enrichment.
+//! The daemon: the one long-running process that holds the vectors.
 //!
-//! Runs four background tasks:
-//! 1. File watcher (existing) — auto-import new JSONL files
-//! 2. Extraction loop (Layer 2) — V3 extraction on imported conversations
-//! 3. Narrator loop (Layer 3) — AI batch narrative generation (if API key set)
-//! 4. Consolidation loop (Layer 4) — Dreamer v1 typed fact extraction from narratives
+//! It serves the MCP endpoint, answers Claude Code hooks over a Unix socket
+//! (see [`hook_server`]), and runs the background work:
+//! 1. File watcher: auto-import new and changed JSONL transcripts
+//! 2. Extraction loop (Layer 2): V3 extraction on imported conversations
+//! 3. Narrator loop (Layer 3): AI batch narrative generation (if API key set)
+//! 4. Consolidation loop (Layer 4): Dreamer v1 typed fact extraction
+//! 5. Vector sync: picks up rows other processes wrote to SQLite
 
 pub mod consolidation;
+pub mod hook_server;
 pub mod ratification;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
@@ -45,14 +49,19 @@ impl Default for DaemonConfig {
     }
 }
 
+/// How often the daemon looks for vectors other processes wrote to SQLite.
+const VECTOR_SYNC_INTERVAL: Duration = Duration::from_secs(30);
+
 /// The daemon orchestrates file watching + enrichment loops.
 pub struct Daemon {
+    engine: crate::engine::Engine,
     storage: Arc<Storage>,
     embeddings: Arc<EmbeddingEngine>,
     search: Arc<RwLock<SearchEngine>>,
     projects_dir: PathBuf,
-    index_dir: PathBuf,
     config: DaemonConfig,
+    /// Unix socket the hook clients connect to.
+    hook_socket: PathBuf,
     api_client: Option<AnthropicClient>,
     /// When set, the daemon also hosts the MCP endpoint over Streamable HTTP
     /// on this address, sharing the state it has already loaded.
@@ -60,30 +69,31 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    pub fn new(
-        storage: Arc<Storage>,
-        embeddings: Arc<EmbeddingEngine>,
-        search: Arc<RwLock<SearchEngine>>,
-        projects_dir: PathBuf,
-        index_dir: PathBuf,
-        config: DaemonConfig,
-        enable_ai: bool,
-    ) -> Self {
+    /// `engine` may be unloaded ([`crate::engine::Engine::new_unloaded`]):
+    /// [`Self::run`] binds its endpoints first and loads vectors after.
+    pub fn new(engine: crate::engine::Engine, config: DaemonConfig, enable_ai: bool) -> Self {
         let api_client = if enable_ai {
             AnthropicClient::from_env()
         } else {
             None
         };
         Self {
-            storage,
-            embeddings,
-            search,
-            projects_dir,
-            index_dir,
+            storage: engine.storage().clone(),
+            embeddings: engine.embeddings().clone(),
+            search: engine.search().clone(),
+            projects_dir: engine.projects_dir().to_path_buf(),
+            engine,
             config,
+            hook_socket: hook_server::default_socket_path(),
             api_client,
             mcp_http_addr: None,
         }
+    }
+
+    /// Listen for hook clients on `path` instead of the default socket.
+    pub fn with_hook_socket(mut self, path: PathBuf) -> Self {
+        self.hook_socket = path;
+        self
     }
 
     /// Also host the MCP endpoint over Streamable HTTP on `addr`.
@@ -139,13 +149,79 @@ impl Daemon {
         // Shared shutdown flag for graceful termination (D-8)
         let shutdown = Arc::new(AtomicBool::new(false));
 
+        // Endpoints first, so a session that starts while the vectors load
+        // still gets its MCP tools and its hooks connect. Requests that need
+        // vectors wait for the load (it holds the search write lock).
+        let hook_listener = hook_server::bind(&self.hook_socket)?;
+        let hook_handle = {
+            let engine = self.engine.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(hook_server::serve(hook_listener, engine, shutdown))
+        };
+        tracing::info!(socket = %self.hook_socket.display(), "hook socket listening");
+
+        let mcp_http_handle = match self.mcp_http_addr {
+            Some(addr) => {
+                let server = crate::mcp::CsrServer::new(
+                    self.storage.clone(),
+                    self.embeddings.clone(),
+                    self.search.clone(),
+                    self.projects_dir.clone(),
+                );
+                let listener = crate::mcp::http::bind(addr).await?;
+                let bound = listener.local_addr()?;
+                eprintln!("{}", crate::mcp::http::ready_line(bound));
+                tracing::info!(%bound, "MCP Streamable HTTP endpoint started in daemon");
+                Some(tokio::spawn(async move {
+                    if let Err(e) = crate::mcp::http::serve(server, listener).await {
+                        tracing::error!(error = %e, "MCP Streamable HTTP endpoint stopped");
+                    }
+                }))
+            }
+            None => None,
+        };
+
+        // Warm the embedding model off the request path: the first extraction
+        // tick and the first prompt-submit would otherwise pay for it.
+        {
+            let embeddings = self.embeddings.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = embeddings.warm() {
+                    tracing::warn!(error = %e, "embedding model warm-up failed");
+                }
+            });
+        }
+
+        // Load every vector, then keep up with rows other processes write.
+        let vector_handle = {
+            let engine = self.engine.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                if let Err(e) = engine.load_vectors().await {
+                    crate::telemetry::append_timing_line(&format!("CSR vectors load failed: {e}"));
+                    tracing::error!(error = %e, "vector load failed");
+                }
+                loop {
+                    let ticks = VECTOR_SYNC_INTERVAL.as_secs();
+                    for _ in 0..ticks {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    if let Err(e) = engine.sync_vectors().await {
+                        tracing::warn!(error = %e, "vector sync failed");
+                    }
+                }
+            })
+        };
+
         // Start file watcher
         let watcher = crate::import::watcher::FileWatcher::new(
             self.projects_dir.clone(),
             self.storage.clone(),
             self.embeddings.clone(),
             self.search.clone(),
-            self.index_dir.clone(),
         );
         let watcher_handle = watcher.spawn();
         tracing::info!("file watcher started");
@@ -331,33 +407,6 @@ impl Daemon {
         };
         tracing::info!("plans loop started (~/.claude/plans → source='plan' chunks)");
 
-        // Compaction loop: every 5 minutes, consume the `needs_compaction`
-        // marker a foreground `Engine::new` leaves when the loaded index is
-        // materially tombstoned, and run the full rebuild here, out of every
-        // request path. The rebuild checks the shutdown flag between batches.
-        let compaction_handle = {
-            let engine = crate::engine::Engine::from_parts_with_index_dir(
-                self.storage.clone(),
-                self.embeddings.clone(),
-                self.search.clone(),
-                self.projects_dir.clone(),
-                self.index_dir.clone(),
-            );
-            let shutdown = shutdown.clone();
-            tokio::spawn(async move {
-                loop {
-                    for _ in 0..30 {
-                        if shutdown.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-                    }
-                    compaction_tick(&engine, &shutdown).await;
-                }
-            })
-        };
-        tracing::info!("compaction loop started (needs_compaction marker consumer)");
-
         // Ratification loop — dialog-act scoring (interval via CSR_RATIFICATION_INTERVAL_SECS)
         let ratification_handle = {
             let storage = self.storage.clone();
@@ -368,32 +417,7 @@ impl Daemon {
         };
         tracing::info!("ratification loop started");
 
-        // Optional MCP endpoint over Streamable HTTP, built from the state
-        // this daemon has already loaded. No second index in memory.
-        let mcp_http_handle = match self.mcp_http_addr {
-            Some(addr) => {
-                let server = crate::mcp::CsrServer::new(
-                    self.storage.clone(),
-                    self.embeddings.clone(),
-                    self.search.clone(),
-                    self.projects_dir.clone(),
-                    self.index_dir.clone(),
-                );
-                let listener = crate::mcp::http::bind(addr).await?;
-                let bound = listener.local_addr()?;
-                eprintln!("{}", crate::mcp::http::ready_line(bound));
-                tracing::info!(%bound, "MCP Streamable HTTP endpoint started in daemon");
-                Some(tokio::spawn(async move {
-                    if let Err(e) = crate::mcp::http::serve(server, listener).await {
-                        tracing::error!(error = %e, "MCP Streamable HTTP endpoint stopped");
-                    }
-                }))
-            }
-            None => None,
-        };
-
-        // Wait for Ctrl+C
-        tokio::signal::ctrl_c().await?;
+        wait_for_shutdown_signal().await?;
         tracing::info!("shutting down daemon gracefully");
 
         // Signal all loops to stop
@@ -408,133 +432,38 @@ impl Daemon {
         let _ = tokio::time::timeout(timeout, consolidation_handle).await;
         let _ = tokio::time::timeout(timeout, maintenance_handle).await;
         let _ = tokio::time::timeout(timeout, registry_handle).await;
-        // Plans imports write the HNSW index the flush below persists. A timeout
-        // here would DETACH the task, not stop it — it could then mutate the
-        // index after dump_to_disk read its state (Codex). The loop stops
-        // between plans on shutdown, so at most one bounded import is in
-        // flight: await it fully.
-        let _ = plans_handle.await;
-        // A compaction in flight swaps and publishes the index, so a detached
-        // one could race the shutdown flush below. It stops at the next batch
-        // once the flag is set (or finishes a publish already under way):
-        // await it fully.
-        let _ = compaction_handle.await;
+        // Plans stop between imports on shutdown; let the one in flight finish
+        // so its SQLite writes complete.
+        let _ = tokio::time::timeout(Duration::from_secs(30), plans_handle).await;
+        let _ = tokio::time::timeout(timeout, vector_handle).await;
         let _ = tokio::time::timeout(timeout, ratification_handle).await;
         watcher_handle.abort(); // Watcher uses notify which doesn't check shutdown flag
         if let Some(handle) = mcp_http_handle {
-            // The HTTP server stops itself on Ctrl+C but never observes the
-            // shutdown flag. Make sure it has stopped taking requests before
-            // the index is flushed.
             handle.abort();
         }
-
-        // Flush HNSW index to disk before exit
-        let mut idx = self.search.write().await;
-        if idx.is_dirty() {
-            let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
-            let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
-            if let Err(e) = idx.dump_to_disk(&self.index_dir, chunk_count, refl_count) {
-                tracing::warn!(error = %e, "failed to flush HNSW index on shutdown");
-            } else {
-                tracing::info!("HNSW index flushed to disk on shutdown");
-            }
-        }
+        hook_handle.abort();
+        let _ = std::fs::remove_file(&self.hook_socket);
 
         tracing::info!("daemon stopped");
         Ok(())
     }
 }
 
-/// What one pass of the compaction loop did.
-#[derive(Debug)]
-pub enum CompactionOutcome {
-    /// No `needs_compaction` marker.
-    NoMarker,
-    /// Marker present but no readable manifest to judge it by; left in place.
-    NoManifest,
-    /// Marker present but the published index is no longer materially
-    /// tombstoned (a process that loaded the pre-compaction generation set it
-    /// again). Cleared without a rebuild.
-    StaleMarkerCleared(crate::search::TombstoneCounts),
-    Rebuilt(crate::engine::RebuildReport),
-    /// Shutdown was requested while the rebuild streamed. Nothing published.
-    Cancelled,
-    Failed(String),
-}
-
-/// One compaction check: rebuild only when the marker is present AND the
-/// published manifest is still materially tombstoned. Every outcome except
-/// `NoMarker` is written to hook-timing.log, because the daemon's tracing
-/// output is warn-level only.
-pub async fn compaction_tick(
-    engine: &crate::engine::Engine,
-    shutdown: &Arc<AtomicBool>,
-) -> CompactionOutcome {
-    let index_dir = engine.index_dir().to_path_buf();
-    if !crate::search::needs_compaction(&index_dir) {
-        return CompactionOutcome::NoMarker;
-    }
-    let dir = index_dir.clone();
-    let counts = tokio::task::spawn_blocking(move || crate::search::on_disk_tombstones(&dir))
-        .await
-        .ok()
-        .flatten();
-    let Some(counts) = counts else {
-        crate::telemetry::append_timing_line(
-            "CSR compaction: marker found but no readable manifest, will retry",
-        );
-        return CompactionOutcome::NoManifest;
-    };
-    if !counts.material() {
-        crate::search::clear_needs_compaction(&index_dir);
-        crate::telemetry::append_timing_line(&format!(
-            "CSR compaction: marker cleared, published index not material (chunk tombstones {}/{}, reflection tombstones {}/{})",
-            counts.chunk_blank, counts.chunk_slots, counts.reflection_blank, counts.reflection_slots,
-        ));
-        return CompactionOutcome::StaleMarkerCleared(counts);
-    }
-    // Rebuild only what is over the threshold. Reflections churn far faster
-    // than chunks, and the chunk side is the expensive one.
-    let scope = if counts.chunks_material() {
-        crate::engine::CompactionScope::Full
-    } else {
-        crate::engine::CompactionScope::ReflectionsOnly
-    };
-    crate::telemetry::append_timing_line(&format!(
-        "CSR compaction: started scope={:?} (chunk tombstones {}/{}, reflection tombstones {}/{})",
-        scope,
-        counts.chunk_blank,
-        counts.chunk_slots,
-        counts.reflection_blank,
-        counts.reflection_slots,
-    ));
-    match engine
-        .rebuild_search_index(Some(shutdown.clone()), scope)
-        .await
+/// Wait for Ctrl+C (SIGINT) or SIGTERM. launchd stops the agent with SIGTERM.
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
     {
-        Ok(Some(report)) => {
-            crate::telemetry::append_timing_line(&format!(
-                "CSR compaction: done scope={:?} chunks={} reflections={} build={}ms publish={}ms epoch={}",
-                report.scope,
-                report.chunks,
-                report.reflections,
-                report.build.as_millis(),
-                report.publish.as_millis(),
-                report.epoch,
-            ));
-            CompactionOutcome::Rebuilt(report)
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r?,
+            _ = term.recv() => {}
         }
-        Ok(None) => {
-            crate::telemetry::append_timing_line(
-                "CSR compaction: cancelled by shutdown, nothing published",
-            );
-            CompactionOutcome::Cancelled
-        }
-        Err(e) => {
-            crate::telemetry::append_timing_line(&format!("CSR compaction: failed: {e}"));
-            tracing::warn!(error = %e, "compaction rebuild failed");
-            CompactionOutcome::Failed(e.to_string())
-        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok(())
     }
 }
 

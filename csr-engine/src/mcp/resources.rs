@@ -14,7 +14,6 @@ pub async fn system_health(
     storage: &Arc<Storage>,
     search: &Arc<RwLock<SearchEngine>>,
     db_path: &str,
-    index_dir: &str,
 ) -> String {
     let t0 = Instant::now();
 
@@ -22,15 +21,16 @@ pub async fn system_health(
     let reflections_indexed = storage.count_reflection_embeddings().unwrap_or(0);
 
     let idx = search.read().await;
-    let cache_status = if idx.is_dirty() { "dirty" } else { "clean" };
+    let (chunks_in_memory, reflections_in_memory) = (idx.chunk_count(), idx.reflection_count());
+    drop(idx);
 
     let health = json!({
         "chunks_indexed": chunks_indexed,
         "reflections_indexed": reflections_indexed,
-        "cache_status": cache_status,
+        "chunks_in_memory": chunks_in_memory,
+        "reflections_in_memory": reflections_in_memory,
         "query_ms": t0.elapsed().as_secs_f64() * 1000.0,
         "db_path": db_path,
-        "index_dir": index_dir,
         "binary_version": env!("CARGO_PKG_VERSION"),
     });
 
@@ -39,13 +39,26 @@ pub async fn system_health(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[tokio::test]
-    async fn test_system_health_format() {
-        // Just verify the function signature compiles and returns valid JSON
-        // Full integration test requires storage + search setup
-        let json_str = r#"{"chunks_indexed":0,"reflections_indexed":0,"cache_status":"clean","query_ms":0.1,"db_path":"/tmp/test.db","index_dir":"/tmp/index","binary_version":"0.1.0"}"#;
-        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
-        assert_eq!(parsed["chunks_indexed"], 0);
-        assert!(parsed["binary_version"].is_string());
+    async fn system_health_reports_sqlite_and_in_memory_counts() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        storage
+            .insert_reflection("r1", "x", &[], &[1.0_f32; 384])
+            .unwrap();
+        let mut idx = SearchEngine::new(4);
+        idx.insert_chunk("c1".into(), vec![1.0; 384]);
+        idx.insert_chunk("c2".into(), vec![0.5; 384]);
+        let search = Arc::new(RwLock::new(idx));
+
+        let v: serde_json::Value =
+            serde_json::from_str(&system_health(&storage, &search, "/tmp/x.db").await).unwrap();
+        assert_eq!(v["chunks_indexed"], 0);
+        assert_eq!(v["reflections_indexed"], 1);
+        assert_eq!(v["chunks_in_memory"], 2);
+        assert_eq!(v["reflections_in_memory"], 0);
+        assert_eq!(v["db_path"], "/tmp/x.db");
+        assert!(v["binary_version"].is_string());
     }
 }

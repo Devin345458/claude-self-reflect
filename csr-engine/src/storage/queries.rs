@@ -244,6 +244,46 @@ pub fn delete_chunks_for_conversation(conn: &Connection, conversation_id: &str) 
     Ok(())
 }
 
+/// See [`super::Storage::stream_vectors_after`].
+pub fn stream_vectors_after(
+    conn: &Connection,
+    table: super::VectorTable,
+    after: i64,
+    mut f: impl FnMut(&str, &[f32]),
+) -> Result<i64> {
+    let sql = match table {
+        super::VectorTable::Chunks => {
+            "SELECT rowid, chunk_id, embedding FROM chunk_embeddings WHERE rowid > ?1 ORDER BY rowid"
+        }
+        super::VectorTable::Reflections => {
+            "SELECT rowid, reflection_id, embedding FROM reflection_embeddings WHERE rowid > ?1 ORDER BY rowid"
+        }
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query(params![after])?;
+    let mut max_rowid = after;
+    let mut buf: Vec<f32> = Vec::with_capacity(384);
+    while let Some(row) = rows.next()? {
+        let rowid: i64 = row.get(0)?;
+        max_rowid = max_rowid.max(rowid);
+        let id = row.get_ref(1)?.as_str()?;
+        let bytes = row.get_ref(2)?.as_blob()?;
+        if bytes.is_empty() || bytes.len() % 4 != 0 {
+            continue;
+        }
+        buf.clear();
+        buf.extend(
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c)),
+        );
+        f(id, &buf);
+    }
+    Ok(max_rowid)
+}
+
 pub fn load_all_chunk_vectors(conn: &Connection) -> Result<Vec<(String, Vec<f32>)>> {
     let mut stmt = conn.prepare("SELECT chunk_id, embedding FROM chunk_embeddings")?;
     let rows = stmt.query_map([], |row| {

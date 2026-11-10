@@ -110,12 +110,20 @@ enum Commands {
         #[arg(long, value_name = "ADDR")]
         serve_http: Option<String>,
     },
-    /// Rebuild the whole HNSW index from SQLite now, in the foreground, and
-    /// publish it as a new compaction. The daemon does this on its own when
-    /// the index is materially tombstoned. Stop the daemon first: a running
-    /// daemon skips its own index saves until restart after a compaction it
-    /// did not perform (its imports still reach the index via `stop` hooks).
+    /// Ask the running daemon to reload every vector from SQLite. Rarely
+    /// needed: the daemon loads them at startup and syncs every 30 seconds.
     RebuildIndex,
+    /// Ask the daemon whether it is up: prints its vector counts and queue
+    /// depth as JSON, or exits 1 when it does not answer within 2 seconds.
+    DaemonPing,
+    /// Write the macOS LaunchAgent plist that keeps the daemon running
+    /// (~/Library/LaunchAgents). Keeps the environment of an existing plist.
+    /// scripts/install-local.sh runs this between bootout and bootstrap.
+    AgentPlist {
+        /// Binary the agent runs (default: this executable)
+        #[arg(long)]
+        binary: Option<std::path::PathBuf>,
+    },
     /// Analyze code quality using AST patterns
     Quality {
         /// File path to analyze
@@ -276,24 +284,59 @@ async fn run() -> Result<()> {
         return csr_engine::telemetry::handle(&args.db_path, &args.projects_dir, since, json, tui);
     }
 
+    if let Some(Commands::DaemonPing) = args.command {
+        let socket = csr_engine::daemon::hook_server::default_socket_path();
+        let request = csr_engine::daemon::hook_server::HookRequest {
+            hook: "ping".into(),
+            input: String::new(),
+            cwd: String::new(),
+            env: Default::default(),
+        };
+        match csr_engine::daemon::hook_server::send(
+            &socket,
+            &request,
+            std::time::Duration::from_secs(2),
+        ) {
+            Ok(reply) => {
+                println!("{}", reply.stdout);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("{e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(Commands::AgentPlist { ref binary }) = args.command {
+        let bin = match binary {
+            Some(b) => b.clone(),
+            None => std::env::current_exe()?,
+        };
+        let path = csr_engine::agent::write_plist(&bin)?;
+        println!("{}", path.display());
+        return Ok(());
+    }
+
     if let Some(Commands::RebuildIndex) = args.command {
-        if let Some(parent) = args.db_path.parent() {
-            std::fs::create_dir_all(parent)?;
+        // Vectors live only in the daemon's memory, rebuilt from SQLite at
+        // startup. This asks the running daemon to reload them now.
+        let socket = csr_engine::daemon::hook_server::default_socket_path();
+        let request = csr_engine::daemon::hook_server::HookRequest {
+            hook: "reload-vectors".into(),
+            input: String::new(),
+            cwd: String::new(),
+            env: Default::default(),
+        };
+        let reply = csr_engine::daemon::hook_server::send(
+            &socket,
+            &request,
+            std::time::Duration::from_secs(300),
+        )?;
+        if let Some(err) = reply.error {
+            anyhow::bail!("{err}");
         }
-        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
-        match eng
-            .rebuild_search_index(None, engine::CompactionScope::Full)
-            .await? {
-            Some(r) => println!(
-                "rebuilt index: {} chunks, {} reflections (build {} ms, publish {} ms, compaction epoch {})",
-                r.chunks,
-                r.reflections,
-                r.build.as_millis(),
-                r.publish.as_millis(),
-                r.epoch
-            ),
-            None => anyhow::bail!("index rebuild did not complete"),
-        }
+        println!("{}", reply.stdout);
         return Ok(());
     }
 
@@ -313,27 +356,16 @@ async fn run() -> Result<()> {
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
-        // The daemon embeds on its very first extraction tick (no initial
-        // sleep) — warm the model now, synchronously, instead of paying
-        // the load on that first tick with no log line to explain the
-        // stall.
-        eng.embeddings().warm()?;
+        // Unloaded: the daemon binds its endpoints first and loads the
+        // vectors in the background (see Daemon::run).
+        let eng = engine::Engine::new_unloaded(&args.db_path, &args.projects_dir)?;
         let config = csr_engine::daemon::DaemonConfig {
             extraction_interval_secs: 30,
             batch_size_trigger: batch_size,
             batch_time_trigger_secs: batch_time * 60,
             batch_poll_interval_secs: 60,
         };
-        let mut daemon = csr_engine::daemon::Daemon::new(
-            eng.storage().clone(),
-            eng.embeddings().clone(),
-            eng.search().clone(),
-            eng.projects_dir().to_path_buf(),
-            eng.index_dir().to_path_buf(),
-            config,
-            !no_ai,
-        );
+        let mut daemon = csr_engine::daemon::Daemon::new(eng, config, !no_ai);
         if let Some(addr) = mcp_http_addr {
             daemon = daemon.with_mcp_http(addr);
         }
@@ -344,7 +376,7 @@ async fn run() -> Result<()> {
         ref conversation_ids,
     }) = args.command
     {
-        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let eng = engine::Engine::new_unloaded(&args.db_path, &args.projects_dir)?;
         let storage = eng.storage().clone();
         for cid in conversation_ids {
             match csr_engine::daemon::ratification::process_ratification(&storage, cid).await {
@@ -426,21 +458,9 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         let report = if full {
-            csr_engine::eval::run_full(
-                eng.storage(),
-                eng.embeddings(),
-                eng.search(),
-                eng.index_dir(),
-            )
-            .await
+            csr_engine::eval::run_full(eng.storage(), eng.embeddings(), eng.search()).await
         } else {
-            csr_engine::eval::run_quick(
-                eng.storage(),
-                eng.embeddings(),
-                eng.search(),
-                eng.index_dir(),
-            )
-            .await
+            csr_engine::eval::run_quick(eng.storage(), eng.embeddings(), eng.search()).await
         };
         print!("{}", report.format_text());
         return Ok(());
@@ -458,7 +478,7 @@ async fn run() -> Result<()> {
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let eng = engine::Engine::new_unloaded(&args.db_path, &args.projects_dir)?;
         let stats = csr_engine::import::coedit_backfill::backfill_coedit(
             eng.storage(),
             &args.projects_dir,
@@ -475,7 +495,7 @@ async fn run() -> Result<()> {
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let eng = engine::Engine::new_unloaded(&args.db_path, &args.projects_dir)?;
         let stats =
             csr_engine::import::backfill::backfill_code_graph(&eng, &args.projects_dir, dry_run)?;
         print!("{}", stats.format_text(dry_run));
@@ -489,7 +509,7 @@ async fn run() -> Result<()> {
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let eng = engine::Engine::new_unloaded(&args.db_path, &args.projects_dir)?;
         let stats = csr_engine::import::backfill::backfill_repo_root(&eng, dry_run)?;
         print!("{}", stats.format_text(dry_run));
         return Ok(());
@@ -502,7 +522,7 @@ async fn run() -> Result<()> {
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let eng = engine::Engine::new_unloaded(&args.db_path, &args.projects_dir)?;
         let stats = csr_engine::import::backfill::backfill_attribution(&eng, dry_run)?;
         print!("{}", stats.format_text(dry_run));
         return Ok(());
@@ -516,7 +536,9 @@ async fn run() -> Result<()> {
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        // Only reflections: the story's "related sessions" lookup never
+        // searches chunks, so loading all of them here was 1.4 GB per story.
+        let eng = engine::Engine::new_reflections_only(&args.db_path, &args.projects_dir)?;
         return csr_engine::summarizer::generate_story_cli(&eng, transcript, cwd).await;
     }
 
@@ -532,60 +554,22 @@ async fn run() -> Result<()> {
             return Ok(());
         }
 
-        // Bound this process before anything that can block: reading stdin,
-        // loading or rebuilding the index, the hook itself, and the flush.
-        // See `hooks::hook_deadline`.
+        // Safety net. The client is already bounded by its socket timeouts
+        // (1s connect, 3s or 15s reply); this catches anything else.
         csr_engine::hooks::arm_hook_deadline(name);
 
-        // SessionEnd races app exit: Claude Code cancels hooks still running at
-        // quit, so engine startup + HNSW flush (~0.5s) almost always dies as
-        // "Hook cancelled". Re-spawn ourselves disowned and return immediately;
-        // the child does the real work and survives the parent's cancellation.
-        // SessionEnd output is never injected, so nothing is lost by detaching.
-        if name == "session-end" && std::env::var("CSR_HOOK_DETACHED").as_deref() != Ok("1") {
-            use std::io::{Read, Write};
-            let mut stdin_buf = Vec::new();
-            let _ = std::io::stdin().read_to_end(&mut stdin_buf);
-            let exe = std::env::current_exe()?;
-            let mut cmd = std::process::Command::new(exe);
-            cmd.args(["hook", "session-end"])
-                .env("CSR_HOOK_DETACHED", "1")
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                cmd.process_group(0);
+        // Debug path: run the handler in this process against an engine it
+        // loads itself, as hooks did before the daemon owned the vectors.
+        if std::env::var("CSR_HOOK_LOCAL").as_deref() == Ok("1") {
+            if let Some(parent) = args.db_path.parent() {
+                std::fs::create_dir_all(parent)?;
             }
-            if let Ok(mut child) = cmd.spawn() {
-                if let Some(mut pipe) = child.stdin.take() {
-                    let _ = pipe.write_all(&stdin_buf);
-                }
-            }
+            let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+            csr_engine::hooks::dispatch_hook(name, &eng).await?;
             return Ok(());
         }
 
-        // Other hooks need the engine
-        if let Some(parent) = args.db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        // Write-only hooks (precompact, session-end) import a transcript but
-        // never search, so build an import-only engine that skips loading and
-        // re-dumping the whole HNSW graph. Everyone else needs the loaded index.
-        let eng = {
-            // Hook stdout is the injection channel. A stale or missing cache
-            // makes `Engine::new` rebuild through hnsw_rs, which prints to
-            // stdout; keep that off the channel until the handler owns it.
-            let _quiet = csr_engine::hooks::StdoutQuarantine::begin();
-            if csr_engine::hooks::is_import_only_hook(name) {
-                engine::Engine::new_import_only(&args.db_path, &args.projects_dir)?
-            } else {
-                engine::Engine::new(&args.db_path, &args.projects_dir)?
-            }
-        };
-        csr_engine::hooks::dispatch_hook(name, &eng).await?;
+        csr_engine::daemon::hook_server::run_client(name);
         return Ok(());
     }
 

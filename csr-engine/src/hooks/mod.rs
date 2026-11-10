@@ -1,11 +1,12 @@
-//! Hook dispatcher for Claude Code lifecycle events.
+//! Hook handlers for Claude Code lifecycle events.
 //!
-//! Claude Code invokes hooks as shell commands at lifecycle events. Each hook:
-//! 1. Receives JSON on stdin (session_id, transcript_path, cwd, reason)
-//! 2. Performs work (search, store, file I/O)
-//! 3. Writes text to stdout (injected into Claude's context)
-//! 4. Exits with code 0 (never blocks the session)
+//! Claude Code runs `csr-engine hook <name>` at lifecycle events, with JSON on
+//! stdin. That process is a thin client: it forwards the input to the daemon
+//! (`crate::daemon::hook_server`), prints what the daemon sends back (the
+//! injection, for prompt-submit and session-start), and exits 0. The handlers
+//! in this module run inside the daemon, against the one loaded engine.
 
+pub mod context;
 pub mod install;
 pub mod intent;
 pub mod post_tool_use;
@@ -50,61 +51,43 @@ pub struct HookInput {
     pub source: Option<String>,
 }
 
-/// Read and parse JSON from stdin. Returns a default HookInput if stdin is empty or invalid.
-/// Guards against hanging when invoked from a terminal (S-4 fix).
-/// Claude Code's default hook timeout. The installer sets an explicit timeout
-/// only for session-briefing; every other CSR hook runs under this default.
-const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 60;
-/// Timeout the installer writes for the async session-briefing hook.
-pub const SESSION_BRIEFING_TIMEOUT_SECS: u64 = 150;
-/// post-tool-use is async; installs that set its timeout explicitly use 120s.
-const POST_TOOL_USE_TIMEOUT_SECS: u64 = 120;
-/// The detached session-end child (see main.rs) is never waited on by Claude
-/// Code and imports the whole transcript, so it gets a longer bound.
-const DETACHED_SESSION_END_DEADLINE_SECS: u64 = 300;
+/// Claude Code timeout the installer writes for `name`. The hook client is
+/// done well before it: 1 s to connect, then 15 s for an injection (reply
+/// hooks) or 3 s for an acknowledgement (queued hooks); see
+/// `crate::daemon::hook_server`.
+pub fn installed_timeout_secs(name: &str) -> u64 {
+    match crate::daemon::hook_server::hook_kind(name) {
+        Some(crate::daemon::hook_server::HookKind::Reply) => 20,
+        _ => 10,
+    }
+}
+
 /// A hook stops itself this long before Claude Code would give up on it.
-const DEADLINE_MARGIN_SECS: u64 = 5;
+const DEADLINE_MARGIN_SECS: u64 = 2;
 
 /// How long a hook process may run before it exits on its own.
 ///
-/// Claude Code discards a hook's output when its timeout passes, but it can
-/// leave the process running. A hook that is slow for a systemic reason (a
-/// saturated machine, a cache rebuild) then keeps running while every new
-/// prompt and tool call starts another one: on 2026-11-02, 23 hooks stacked up
-/// for 16 minutes at load average 158. The deadline turns any such cause into
-/// one bounded exit per hook.
+/// A safety net: the client is already bounded by its socket timeouts. Claude
+/// Code discards a hook's output at its timeout but can leave the process
+/// running, so an unbounded hook could still stack up behind a wedged daemon.
 ///
 /// `env_override` is `CSR_HOOK_DEADLINE_SECS`: a positive integer replaces the
 /// table, `0` disables the deadline, anything else is ignored.
-pub fn hook_deadline(
-    name: &str,
-    detached: bool,
-    env_override: Option<&str>,
-) -> Option<std::time::Duration> {
+pub fn hook_deadline(name: &str, env_override: Option<&str>) -> Option<std::time::Duration> {
     if let Some(secs) = env_override.and_then(|raw| raw.trim().parse::<u64>().ok()) {
         return (secs > 0).then(|| std::time::Duration::from_secs(secs));
     }
-    let secs = match name {
-        "session-end" if detached => DETACHED_SESSION_END_DEADLINE_SECS,
-        "session-briefing" => SESSION_BRIEFING_TIMEOUT_SECS - DEADLINE_MARGIN_SECS,
-        "post-tool-use" => POST_TOOL_USE_TIMEOUT_SECS - DEADLINE_MARGIN_SECS,
-        _ => DEFAULT_HOOK_TIMEOUT_SECS - DEADLINE_MARGIN_SECS,
-    };
-    Some(std::time::Duration::from_secs(secs))
+    Some(std::time::Duration::from_secs(
+        installed_timeout_secs(name) - DEADLINE_MARGIN_SECS,
+    ))
 }
 
 /// Start the deadline for this hook process: a background thread that records
 /// the overrun in hook-timing.log and exits the process with code 1, which
 /// Claude Code treats as a non-blocking hook error (never 2, which blocks).
-///
-/// Exiting at any point is safe for the on-disk state: SQLite rolls back an
-/// open transaction, HNSW generations are written under new names, and the
-/// manifest is published by an atomic rename, so the worst leftover is a stray
-/// temporary file that the next dump's cleanup removes.
 pub fn arm_hook_deadline(name: &str) {
-    let detached = std::env::var("CSR_HOOK_DETACHED").as_deref() == Ok("1");
     let env_override = std::env::var("CSR_HOOK_DEADLINE_SECS").ok();
-    let Some(deadline) = hook_deadline(name, detached, env_override.as_deref()) else {
+    let Some(deadline) = hook_deadline(name, env_override.as_deref()) else {
         return;
     };
     let name = name.to_string();
@@ -162,6 +145,13 @@ pub async fn import_current_transcript(input: &HookInput, engine: &Engine, cwd: 
         return;
     }
 
+    // Inside the daemon the file watcher owns transcript imports. Hand it the
+    // path (it de-duplicates within its debounce window) instead of parsing the
+    // whole transcript again on every hook.
+    if context::in_daemon() && crate::import::watcher::nudge(canonical.clone()) {
+        return;
+    }
+
     let cwd_str = cwd.to_string_lossy();
     let project = resolve_project_from_cwd(&cwd_str).unwrap_or_else(|| "unknown".to_string());
 
@@ -169,96 +159,6 @@ pub async fn import_current_transcript(input: &HookInput, engine: &Engine, cwd: 
         Ok(0) => {} // no new content, silent
         Ok(n) => eprintln!("CSR: indexed {} new chunks from active session", n),
         Err(e) => eprintln!("CSR: import failed (non-fatal): {}", e),
-    }
-}
-
-/// Redirect this process's stdout (fd 1) onto stderr (fd 2) for the rest of the
-/// hook.
-///
-/// Hook stdout is Claude Code's context-injection channel on `UserPromptSubmit`
-/// and `SessionStart`, so a stray library print lands in the model's context as
-/// if it were retrieved memory. `hnsw_rs` 0.3.4 has a bare `println!` in
-/// `generate_new_point` (hnsw.rs:520) that fires on every 50,000th point insert,
-/// so any indexing performed *after* a hook has emitted its injection can leak
-/// `" setting number of points N "` into the prompt.
-///
-/// Call this once a hook has finished writing its intended output. There is no
-/// restore: the hook process exits immediately afterwards.
-///
-/// Unix only. On Windows Rust's stdout writes to the Win32 standard handle, not
-/// CRT fd 1, so `_dup2` would not redirect it; the call is a no-op there.
-pub fn suppress_stdout() {
-    // Anything still sitting in Rust's stdout buffer (a `print!` with no trailing
-    // newline) belongs to the injection. Push it out before fd 1 moves, or it
-    // would be flushed to stderr at exit and the injection would be lost.
-    let _ = std::io::Write::flush(&mut std::io::stdout());
-
-    #[cfg(unix)]
-    // SAFETY: dup2 on this process's own standard descriptors. A failure here is
-    // non-fatal — the worst case is the pre-existing leak — so the result is
-    // deliberately ignored.
-    unsafe {
-        libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO);
-    }
-}
-
-/// Points stdout (fd 1) at stderr for as long as it is alive, then puts the real
-/// stdout back on drop.
-///
-/// [`suppress_stdout`] covers prints made *after* a hook has written its
-/// injection. This covers the ones made *before* it: `Engine::new` rebuilds or
-/// backfills an index whenever the on-disk cache is missing or stale, and that
-/// is the same `hnsw_rs` insert path with the same bare `println!`. Those lines
-/// reached the model ahead of the injection, e.g. `" setting number of points
-/// 50000 "` on every prompt that followed a reflection insert, because the
-/// ~59k-point reflection index was rebuilt in-process. `HnswIo::init` also
-/// prints to stdout when a cache file is missing.
-///
-/// Hold one across engine construction in the hook path, and drop it before the
-/// handler runs so the injection still reaches Claude Code.
-///
-/// Unix only, for the reason given on [`suppress_stdout`].
-pub struct StdoutQuarantine {
-    #[cfg(unix)]
-    target: libc::c_int,
-    #[cfg(unix)]
-    saved: libc::c_int,
-}
-
-impl StdoutQuarantine {
-    pub fn begin() -> Self {
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        #[cfg(unix)]
-        {
-            Self::begin_on(libc::STDOUT_FILENO, libc::STDERR_FILENO)
-        }
-        #[cfg(not(unix))]
-        {
-            Self {}
-        }
-    }
-
-    #[cfg(unix)]
-    fn begin_on(target: libc::c_int, sink: libc::c_int) -> Self {
-        let saved = divert_fd(target, sink);
-        Self { target, saved }
-    }
-}
-
-impl Drop for StdoutQuarantine {
-    fn drop(&mut self) {
-        // Whatever is still buffered was printed under quarantine; send it to the
-        // sink before the real stdout comes back.
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        #[cfg(unix)]
-        if self.saved >= 0 {
-            // SAFETY: restores the descriptor saved in `begin_on`, then closes
-            // the spare copy.
-            unsafe {
-                libc::dup2(self.saved, self.target);
-                libc::close(self.saved);
-            }
-        }
     }
 }
 
@@ -401,78 +301,19 @@ impl ClaimedStdout {
     }
 }
 
-/// Whether a hook can run on an import-only engine that skips loading and
-/// persisting the HNSW index (see [`crate::engine::Engine::new_import_only`]).
-///
-/// `precompact` and `session-end` only import a transcript (and, for
-/// session-end, write reflections to SQLite). Neither queries the HNSW, so
-/// skipping the load is safe and the new rows are reconciled by the additive
-/// backfill in `Engine::new` on the next search-time load.
-///
-/// Everything else stays on the full engine. `session-start` and
-/// `prompt-submit` query the index. `stop` and `post-tool-use` are left out
-/// to keep the scope matched to upstream PR #304.
-pub fn is_import_only_hook(hook_name: &str) -> bool {
-    matches!(hook_name, "precompact" | "session-end")
-}
-
-/// Main hook dispatcher. Parses stdin, routes to handler.
-/// Whether a hook is allowed to persist HNSW changes to the on-disk cache
-/// after it runs. Persistence used to be an unconditional side effect of
-/// `dispatch_hook` — every hook dumped whatever its engine happened to be
-/// holding dirty, including the additive backfill `Engine::new` performs on
-/// EVERY start whenever the cache trails SQLite. That made a purely
-/// read-only hook pay to rewrite the entire HNSW graph (measured up to ~25s
-/// on a ~1GB index — see hook-timing.log) whenever it happened to run
-/// against a stale-but-additive cache.
-///
-/// `prompt-submit` and `post-tool-use` are on Claude Code's hook budget
-/// (30s) and, for `prompt-submit`, its stdout IS the context-injection
-/// channel — a hook killed at the budget silently loses its injection. They
-/// must never persist. `session-start` and `session-briefing` are equally
-/// injection-critical (recap / briefing content) and are excluded for the
-/// same reason, even though they query the index and could plausibly argue
-/// for writing back a backfill. `precompact` and `session-end` import a
-/// transcript but are not the designated persister either; SQLite still has
-/// every row they wrote, and the next `stop`, the daemon's watcher or the
-/// startup backfill reconciles the cache.
-///
-/// `stop` is the one hook that may persist: it runs after the response is
-/// already delivered (not on the injection path), and it is the hook most
-/// likely to have just inserted a reflection the user wants to find next
-/// session.
-///
-/// This is a role gate layered ON TOP of `flush_index`'s existing dirty
-/// check: it answers "should this hook even attempt a flush", not "does it
-/// have anything to write". It is the SOLE allowlist — there is no staleness
-/// escape hatch for the excluded hooks. Persistence on this line is: `stop`
-/// (this predicate), the daemon's watcher batches and shutdown flush, the
-/// MCP server's `store_reflection`/`flush_index`, and the CLI
-/// import/enrichment paths — nothing else.
-pub fn hook_may_persist_index(hook_name: &str) -> bool {
-    matches!(hook_name, "stop")
-}
-
+/// Run a hook in this process, reading its input from stdin, against an
+/// engine this process built. The installed hooks never do this (they forward
+/// to the daemon); it remains for debugging a handler without a daemon.
 pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
-    // Recursive-hook guard. The session-briefing hook spawns a nested `claude -p`
-    // with CSR_DISABLE_RECURSIVE_HOOKS=1 in its env. That nested session inherits
-    // the user's hook config and would otherwise fire CSR hooks — most damagingly
-    // the Stop hook, which would store the analyst transcript as a `session_episode`
-    // ("You are CSR Episode Analyst..."). Those meta-episodes then dominate the
-    // episode store and feed back into the next briefing. Skip ALL hooks in any
-    // process descended from the briefing subprocess. (The var propagates to the
-    // nested `claude -p` and on to the `csr-engine hook ...` it spawns.)
-    if std::env::var("CSR_DISABLE_RECURSIVE_HOOKS").as_deref() == Ok("1") {
-        return Ok(());
-    }
-
-    let t0 = std::time::Instant::now();
     let input = read_stdin_json();
-    let t_stdin = t0.elapsed();
+    run_hook(hook_name, &input, engine, &std::env::current_dir()?).await
+}
 
-    // Determine CWD: prefer input.cwd, fall back to process CWD
-    // Validate that cwd is a real directory under $HOME (S-3 fix)
-    let cwd = if let Some(ref dir) = input.cwd {
+/// Resolve the working directory a hook should act in: the `cwd` Claude Code
+/// sent, if it is a real directory under `$HOME` (S-3 fix), else `fallback`
+/// (the hook process's own working directory).
+pub fn resolve_hook_cwd(input: &HookInput, fallback: &Path) -> Result<std::path::PathBuf> {
+    if let Some(ref dir) = input.cwd {
         let p = std::path::PathBuf::from(dir);
         if p.is_dir() {
             let canonical = p.canonicalize()?;
@@ -481,64 +322,48 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
                     anyhow::bail!("cwd {} is outside home directory", canonical.display());
                 }
             }
-            canonical
-        } else {
-            std::env::current_dir()?
+            return Ok(canonical);
         }
-    } else {
-        std::env::current_dir()?
-    };
+    }
+    Ok(fallback.to_path_buf())
+}
 
-    let t_setup = t0.elapsed();
+/// Run one hook handler. Shared by the daemon, for forwarded hooks, and by
+/// [`dispatch_hook`]. Logs one timing line to hook-timing.log.
+pub async fn run_hook(
+    hook_name: &str,
+    input: &HookInput,
+    engine: &Engine,
+    fallback_cwd: &Path,
+) -> Result<()> {
+    let t0 = std::time::Instant::now();
+    let cwd = resolve_hook_cwd(input, fallback_cwd)?;
 
     let result = match hook_name {
-        "session-start" => session_start::handle(&input, engine, &cwd).await,
-        "session-briefing" => session_briefing::handle(&input, engine, &cwd).await,
-        "session-end" => session_end::handle(&input, engine, &cwd).await,
-        "precompact" => precompact::handle(&input, engine, &cwd).await,
-        "stop" => stop::handle(&input, engine, &cwd).await,
-        "post-tool-use" => post_tool_use::handle(&input, engine, &cwd).await,
-        "prompt-submit" => prompt_submit::handle(&input, engine, &cwd).await,
+        "session-start" => session_start::handle(input, engine, &cwd).await,
+        "session-briefing" => session_briefing::handle(input, engine, &cwd).await,
+        "session-end" => session_end::handle(input, engine, &cwd).await,
+        "precompact" => precompact::handle(input, engine, &cwd).await,
+        "stop" => stop::handle(input, engine, &cwd).await,
+        "post-tool-use" => post_tool_use::handle(input, engine, &cwd).await,
+        "prompt-submit" => prompt_submit::handle(input, engine, &cwd).await,
         _ => {
             eprintln!("unknown hook: {}", hook_name);
             Ok(())
         }
     };
-    let t_hook = t0.elapsed();
 
-    // Persist HNSW changes only if this hook's role allows it — see
-    // `hook_may_persist_index`, the sole allowlist. Injection-critical hooks
-    // (prompt-submit, post-tool-use, session-start, session-briefing) skip
-    // this entirely, so their `flush=` timing below is ~0ms even when
-    // `Engine::new`'s additive backfill left the in-memory index dirty.
-    // Nothing after the handler should reach stdout; see suppress_stdout.
-    suppress_stdout();
-    if hook_may_persist_index(hook_name) {
-        // Reflections only: the chunk side is 1.7 GB on a real install, and a
-        // full flush here rewrote it after nearly every response. New chunks
-        // are already in SQLite; the daemon persists the chunk side on a timer.
-        engine.flush_index_reflections_only().await;
-    }
-    let t_total = t0.elapsed();
-
-    // Resolve project name for logging
     let cwd_str = cwd.to_string_lossy();
     let project = resolve_project_from_cwd(&cwd_str).unwrap_or_else(|| "unknown".to_string());
-
-    let timing_line = format!(
-        "CSR hook {} [{}]: stdin={}ms setup={}ms hook={}ms flush={}ms total={}ms",
-        hook_name,
-        project,
-        t_stdin.as_millis(),
-        (t_setup - t_stdin).as_millis(),
-        (t_hook - t_setup).as_millis(),
-        (t_total - t_hook).as_millis(),
-        t_total.as_millis(),
-    );
-    eprintln!("{}", timing_line);
-
-    // Append to timing log file for post-session analysis
-    crate::telemetry::append_timing_line(&timing_line);
+    let where_ = if context::in_daemon() {
+        "daemon"
+    } else {
+        "local"
+    };
+    crate::telemetry::append_timing_line(&format!(
+        "CSR hook {hook_name} [{project}]: hook={ms}ms total={ms}ms ({where_})",
+        ms = t0.elapsed().as_millis()
+    ));
 
     result
 }
@@ -546,43 +371,6 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-
-    /// The guard must divert writes while held and hand the descriptor back
-    /// intact afterwards. Run on a pair of pipes so the test process's own
-    /// stdout is never touched.
-    #[test]
-    fn stdout_quarantine_diverts_then_restores() {
-        fn pipe() -> (libc::c_int, libc::c_int) {
-            let mut fds = [0 as libc::c_int; 2];
-            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-            (fds[0], fds[1])
-        }
-        fn write_fd(fd: libc::c_int, bytes: &[u8]) {
-            let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-            assert_eq!(n, bytes.len() as isize);
-        }
-        fn read_fd(fd: libc::c_int) -> String {
-            let mut buf = [0u8; 64];
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-            assert!(n > 0, "nothing arrived on fd {fd}");
-            String::from_utf8_lossy(&buf[..n as usize]).into_owned()
-        }
-
-        let (out_r, out_w) = pipe();
-        let (sink_r, sink_w) = pipe();
-
-        let guard = StdoutQuarantine::begin_on(out_w, sink_w);
-        write_fd(out_w, b"library noise");
-        assert_eq!(read_fd(sink_r), "library noise");
-        drop(guard);
-
-        write_fd(out_w, b"injection");
-        assert_eq!(read_fd(out_r), "injection");
-
-        for fd in [out_r, out_w, sink_r, sink_w] {
-            unsafe { libc::close(fd) };
-        }
-    }
 
     /// The MCP claim must behave like the hook quarantine's diversion half:
     /// once claimed, library writes to the target land on the sink, and the
@@ -741,96 +529,47 @@ mod tests {
     }
 
     #[test]
-    fn only_write_only_hooks_skip_the_index() {
-        // Write-only importers may run on the import-only engine.
-        assert!(is_import_only_hook("precompact"));
-        assert!(is_import_only_hook("session-end"));
-        // session-start and prompt-submit query the index and must keep it
-        // loaded, or they search an empty index and silently return nothing.
-        for full in ["stop", "session-start", "prompt-submit", "post-tool-use"] {
+    fn hook_deadline_stays_under_each_hooks_installed_timeout() {
+        use std::time::Duration;
+        for (name, deadline) in [
+            ("prompt-submit", 18),
+            ("session-start", 18),
+            ("stop", 8),
+            ("post-tool-use", 8),
+            ("precompact", 8),
+            ("session-end", 8),
+            ("session-briefing", 8),
+            ("some-future-hook", 8),
+        ] {
+            let d = hook_deadline(name, None).unwrap();
+            assert_eq!(d, Duration::from_secs(deadline), "{name}");
             assert!(
-                !is_import_only_hook(full),
-                "{full} must not be treated as import-only"
+                d < Duration::from_secs(installed_timeout_secs(name)),
+                "{name}"
             );
         }
-    }
-
-    #[test]
-    fn hook_deadline_stays_under_each_hooks_claude_code_timeout() {
-        use std::time::Duration;
-        let secs = |name, detached| hook_deadline(name, detached, None).unwrap();
-
-        for blocking in [
-            "prompt-submit",
-            "stop",
-            "session-start",
-            "precompact",
-            "session-end",
-        ] {
-            assert_eq!(secs(blocking, false), Duration::from_secs(55), "{blocking}");
-        }
-        assert_eq!(secs("session-briefing", false), Duration::from_secs(145));
-        assert!(
-            secs("session-briefing", false) < Duration::from_secs(SESSION_BRIEFING_TIMEOUT_SECS),
-            "briefing deadline must stay under the timeout the installer writes"
-        );
-        assert_eq!(secs("post-tool-use", false), Duration::from_secs(115));
-        // The detached session-end child is never waited on and imports the
-        // whole transcript; the non-detached parent returns immediately.
-        assert_eq!(secs("session-end", true), Duration::from_secs(300));
-        // Unknown names get the default bound, never none.
-        assert_eq!(secs("some-future-hook", false), Duration::from_secs(55));
     }
 
     #[test]
     fn hook_deadline_env_override() {
         use std::time::Duration;
         assert_eq!(
-            hook_deadline("stop", false, Some("7")),
+            hook_deadline("stop", Some("7")),
             Some(Duration::from_secs(7))
         );
         assert_eq!(
-            hook_deadline("stop", false, Some(" 7 ")),
+            hook_deadline("stop", Some(" 7 ")),
             Some(Duration::from_secs(7))
         );
         assert_eq!(
-            hook_deadline("stop", false, Some("0")),
+            hook_deadline("stop", Some("0")),
             None,
             "0 disables the deadline"
         );
         assert_eq!(
-            hook_deadline("stop", false, Some("soon")),
-            Some(Duration::from_secs(55)),
+            hook_deadline("stop", Some("soon")),
+            Some(Duration::from_secs(8)),
             "an unparseable override falls back to the table"
         );
-    }
-
-    #[test]
-    fn only_stop_may_persist_the_index() {
-        // Positive: the one hook the design assigns as the persister.
-        assert!(
-            hook_may_persist_index("stop"),
-            "stop must be allowed to persist — it's the designated hook persister"
-        );
-        // Negative cases: a future regression that adds any of these to the
-        // persist set would silently reintroduce full-size dumps on the
-        // Claude Code injection path (prompt-submit's stdout IS the
-        // injection channel) or on the hook-latency budget generally.
-        for readonly in [
-            "prompt-submit",
-            "post-tool-use",
-            "session-start",
-            "session-briefing",
-            "precompact",
-            "session-end",
-        ] {
-            assert!(
-                !hook_may_persist_index(readonly),
-                "{readonly} must never persist the HNSW index — it is injection-critical \
-                 or explicitly out of scope for this optimization"
-            );
-        }
-        // Unknown hook names must not accidentally persist either.
-        assert!(!hook_may_persist_index("some-future-hook"));
     }
 }

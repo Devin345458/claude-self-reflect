@@ -56,14 +56,9 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
         eprintln!("CSR: prompt-submit hook error (non-fatal): {}", e);
     }
 
-    // Chunk the active transcript after injection is printed to stdout.
-    // Incremental: mtime check makes this a no-op when nothing changed (~0ms).
-    // When new content exists: ~30-50ms for 1-2 chunks (well under perceptible lag).
-    // Content becomes searchable by the next prompt submit.
-    // Injection is done; from here nothing may touch stdout. Indexing inserts
-    // HNSW points, and hnsw_rs prints to stdout on insert, which would land in
-    // the model's context as fake retrieved memory. See super::suppress_stdout.
-    super::suppress_stdout();
+    // Chunk the active transcript after the injection is written, so its
+    // content is searchable by the next prompt. Inside the daemon this only
+    // hands the path to the file watcher.
     super::import_current_transcript(input, engine, cwd).await;
 
     Ok(()) // Always succeed
@@ -139,7 +134,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // STATE_RECALL_PROBES check. Falls through to Route B when the prompt
     // is a content question about specific past work.
     if let Some(probes) = crate::hooks::intent::ProbeSet::load_or_build(embeddings).await {
-        if std::env::var("CSR_DEBUG_CORRELATE").is_ok() {
+        if super::context::env_var("CSR_DEBUG_CORRELATE").is_some() {
             for (i, s) in probes.scores(&query_vec) {
                 eprintln!("CSR intent score: {i:?} {s:.3}");
             }
@@ -202,7 +197,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                     .await;
                     if let Some((ep, age, _score)) = &corr {
                         if let Some(map) = format_code_map(ep, age) {
-                            println!("{}", map);
+                            crate::hook_println!("{}", map);
                             return Ok(());
                         }
                     }
@@ -225,7 +220,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             let names: Vec<(String, String)> =
                 rows.into_iter().map(|(sid, a)| (sid, a.name)).collect();
             if let Some((sid, name)) = symbol_overlap(prompt, &names) {
-                println!(
+                crate::hook_println!(
                     "CSR: `{}` was modified in a recent session — episode: csr_reflect_on_past(\"conv_{}\")",
                     name, sid
                 );
@@ -251,7 +246,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // rewritten to "failed approach don't retry: ..."), which the upstream
     // comment above keeps deliberately separate from the main query vector.
     // Set CSR_NO_ANTI_PATTERNS=1 to trade that recall for latency.
-    let anti_patterns = if std::env::var("CSR_NO_ANTI_PATTERNS").as_deref() == Ok("1") {
+    let anti_patterns = if super::context::env_var("CSR_NO_ANTI_PATTERNS").as_deref() == Some("1") {
         Vec::new()
     } else {
         anti_pattern::find_anti_patterns(storage, embeddings, search, prompt, 0.5, 2).await
@@ -277,7 +272,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         }
     };
     if let Some((ep, age, score)) = correlated {
-        print!("{}", format_semantic_pickup(&ep, &age, score));
+        crate::hook_print!("{}", format_semantic_pickup(&ep, &age, score));
     }
 
     // 2. Search chunks (past conversations) — scoped to current project
@@ -360,7 +355,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // Opt-out: graph slices issue one SQLite query per qualifying prompt token
     // (now bounded by MAX_SYMBOL_PROBES) plus a file-ledger read. Set
     // CSR_NO_GRAPH_SLICES=1 to skip the stage entirely.
-    let graph_slices = if std::env::var("CSR_NO_GRAPH_SLICES").as_deref() == Ok("1") {
+    let graph_slices = if super::context::env_var("CSR_NO_GRAPH_SLICES").as_deref() == Some("1") {
         Vec::new()
     } else {
         build_graph_slices(storage, prompt, &current_files, &current_project)
@@ -427,7 +422,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     if !formatted.is_empty() {
         // stdout injection: Claude Code prepends this to the system prompt.
         // Uses print! (not println!) to avoid double-newline — formatter output ends with \n.
-        print!("{}", formatted);
+        crate::hook_print!("{}", formatted);
     }
 
     // TAD: Log retrieval events only for actually-injected items (not filtered-out ones)
@@ -499,12 +494,14 @@ fn is_continuation_prompt(prompt: &str) -> bool {
 /// Continue / StateRecall) — the CONTINUUM banner is reserved for the active
 /// conversation lineage, never for a Route-B topic match.
 fn emit_pickup(ep: &crate::hooks::stop::Episode, age: &str, reason: &str) {
-    println!("CSR PICKUP — {}", reason);
-    print!(
+    crate::hook_println!("CSR PICKUP — {}", reason);
+    crate::hook_print!(
         "{}",
         crate::hooks::session_start::format_tier0_block(ep, &[], age)
     );
-    println!("Resume from LAST/NEXT above; run the Full state lookup before re-deriving anything.");
+    crate::hook_println!(
+        "Resume from LAST/NEXT above; run the Full state lookup before re-deriving anything."
+    );
 }
 
 /// Minimum length (both sides) before a prompt/episode-request containment
@@ -624,7 +621,7 @@ async fn correlate_episode(
     // score order alone anchored a 3-week-old prompt-echo over the session
     // that ended two hours earlier (see EPISODE_RECENCY_HALF_LIFE_DAYS).
     let mut eligible: Vec<(f32, f32, crate::hooks::stop::Episode, String)> = Vec::new();
-    let debug = std::env::var("CSR_DEBUG_CORRELATE").is_ok();
+    let debug = super::context::env_var("CSR_DEBUG_CORRELATE").is_some();
     for r in &results {
         let Ok(Some((_, tags, _))) = engine.storage().get_reflection_by_id(&r.id) else {
             continue;
@@ -667,7 +664,7 @@ async fn correlate_episode(
             .map(|t| ((now - t).num_minutes() as f32 / 1440.0).max(0.0))
             .unwrap_or(f32::INFINITY);
         let age = crate::hooks::session_start::relative_time_label(&ts, &now);
-        if std::env::var("CSR_DEBUG_CORRELATE").is_ok() {
+        if super::context::env_var("CSR_DEBUG_CORRELATE").is_some() {
             eprintln!(
                 "CSR correlate candidate: raw={:.3} age_days={:.2} conv={}",
                 r.score, age_days, ep.session_id

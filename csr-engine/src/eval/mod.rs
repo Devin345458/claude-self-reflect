@@ -9,7 +9,6 @@ pub mod codegraph;
 pub mod continuity;
 pub mod provenance;
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -95,7 +94,6 @@ pub async fn run_quick(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
     search: &Arc<RwLock<SearchEngine>>,
-    index_dir: &Path,
 ) -> EvalReport {
     let start = Instant::now();
     let mut results = Vec::new();
@@ -103,7 +101,7 @@ pub async fn run_quick(
     results.push(test_db_connectivity(storage));
     results.push(test_search_accuracy(storage, embeddings, search).await);
     results.push(test_performance(embeddings, search).await);
-    results.push(test_cache_status(index_dir));
+    results.push(test_vectors_match_storage(storage, search).await);
     results.push(test_tool_count());
 
     EvalReport {
@@ -117,7 +115,6 @@ pub async fn run_full(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
     search: &Arc<RwLock<SearchEngine>>,
-    index_dir: &Path,
 ) -> EvalReport {
     let start = Instant::now();
     let mut results = Vec::new();
@@ -126,7 +123,7 @@ pub async fn run_full(
     results.push(test_db_connectivity(storage));
     results.push(test_search_accuracy(storage, embeddings, search).await);
     results.push(test_performance(embeddings, search).await);
-    results.push(test_cache_status(index_dir));
+    results.push(test_vectors_match_storage(storage, search).await);
     results.push(test_tool_count());
 
     // Semantic search tests (5)
@@ -317,35 +314,27 @@ async fn test_performance(
     }
 }
 
-fn test_cache_status(index_dir: &Path) -> EvalResult {
+/// The daemon's in-memory vectors must mirror SQLite: same row count on both
+/// sides. A mismatch that outlives a sync means searches miss rows or return
+/// deleted ones.
+async fn test_vectors_match_storage(
+    storage: &Arc<Storage>,
+    search: &Arc<RwLock<SearchEngine>>,
+) -> EvalResult {
     let t = Instant::now();
-    let manifest_path = index_dir.join("index_manifest.json");
-
-    if manifest_path.exists() {
-        let metadata = std::fs::metadata(&manifest_path);
-        let detail = match metadata {
-            Ok(m) => {
-                let age = m.modified().ok().and_then(|mt| mt.elapsed().ok());
-                match age {
-                    Some(d) => format!("warm (age: {}s)", d.as_secs()),
-                    None => "warm".to_string(),
-                }
-            }
-            Err(_) => "warm (unreadable metadata)".to_string(),
-        };
-        EvalResult::pass(
-            "Cache Status",
-            "infrastructure",
-            t.elapsed().as_secs_f64() * 1000.0,
-            detail,
-        )
+    let db_chunks = storage.count_chunk_embeddings().unwrap_or(0);
+    let db_reflections = storage.count_reflection_embeddings().unwrap_or(0);
+    let idx = search.read().await;
+    let (mem_chunks, mem_reflections) = (idx.chunk_count(), idx.reflection_count());
+    drop(idx);
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    let detail = format!(
+        "chunks {mem_chunks}/{db_chunks}, reflections {mem_reflections}/{db_reflections} (memory/SQLite)"
+    );
+    if mem_chunks == db_chunks && mem_reflections == db_reflections {
+        EvalResult::pass("Vectors Match Storage", "infrastructure", ms, detail)
     } else {
-        EvalResult::pass(
-            "Cache Status",
-            "infrastructure",
-            t.elapsed().as_secs_f64() * 1000.0,
-            "cold (no manifest — first run)".to_string(),
-        )
+        EvalResult::fail("Vectors Match Storage", "infrastructure", ms, detail)
     }
 }
 

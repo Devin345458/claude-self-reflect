@@ -111,6 +111,11 @@ pub fn append_timing_line(line: &str) {
     let Some(log_path) = default_log_path() else {
         return;
     };
+    // A hook client may be the first CSR process to run on this machine, and
+    // it creates nothing else under ~/.claude-self-reflect.
+    if let Some(dir) = log_path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     if let (Ok(md), Some(old)) = (std::fs::metadata(&log_path), rotated_log_path()) {
         if md.len() >= MAX_TIMING_LOG_BYTES {
             let _ = std::fs::rename(&log_path, &old);

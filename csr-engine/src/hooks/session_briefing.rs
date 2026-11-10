@@ -136,7 +136,9 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
     // Shell out to claude -p, walking the narrative model chain on model-not-found.
     // Block on tokio's spawn_blocking since std::process::Command is sync.
     let started = std::time::Instant::now();
-    let result = tokio::task::spawn_blocking(move || invoke_narrative_briefing(&prompt)).await?;
+    let child_cwd = cwd.to_path_buf();
+    let result =
+        tokio::task::spawn_blocking(move || invoke_narrative_briefing(&prompt, &child_cwd)).await?;
     let duration_ms = started.elapsed().as_millis() as i64;
     let parsed = match result {
         Ok(p) => p,
@@ -178,7 +180,7 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
     }
 
     // Store briefing as a tagged reflection — replace any prior briefing for this project
-    store_briefing(engine, project_name, &parsed.text)?;
+    store_briefing(engine, project_name, &parsed.text).await?;
     let _ = engine.storage().set_meta(&hash_key, &episode_digest);
 
     Ok(())
@@ -192,7 +194,13 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
 /// empty MCP config with `--strict-mcp-config` so the subprocess loads ZERO MCP
 /// servers (not even csr-engine) — fastest possible `claude -p` startup and no
 /// recursive csr-engine spawn.
-fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNarrative> {
+///
+/// `cwd` is the session's directory: the hook runs inside the daemon, whose
+/// own working directory is `$HOME`.
+fn invoke_narrative_briefing(
+    prompt: &str,
+    cwd: &Path,
+) -> Result<crate::narrative::ParsedNarrative> {
     let mcp_config_path = crate::narrative::minimal_mcp_config()?;
     let mut last_err: Option<anyhow::Error> = None;
     // Probed once per call, outside the model loop, and never cached for the
@@ -217,6 +225,7 @@ fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNar
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
+        .current_dir(cwd)
         .env("CSR_DISABLE_RECURSIVE_HOOKS", "1"); // signal to nested csr-engine to skip hooks
 
         let mut child = cmd.spawn()?;
@@ -259,7 +268,7 @@ fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNar
 
 /// Store briefing as a tagged reflection. Replaces any previous briefing
 /// for the same project (delete + insert).
-fn store_briefing(engine: &Engine, project: &str, briefing: &str) -> Result<()> {
+async fn store_briefing(engine: &Engine, project: &str, briefing: &str) -> Result<()> {
     let project_tag = format!("project_{}", project);
     let tags = vec![
         "session_briefing".to_string(),
@@ -272,19 +281,29 @@ fn store_briefing(engine: &Engine, project: &str, briefing: &str) -> Result<()> 
         .storage()
         .get_reflections_by_tag("session_briefing", 50)
     {
+        let mut idx = engine.search().write().await;
         for (id, _, ref existing_tags, _) in &existing {
-            if existing_tags.iter().any(|t| t == &project_tag) {
-                let _ = engine.storage().delete_reflection(id);
+            if existing_tags.iter().any(|t| t == &project_tag)
+                && engine.storage().delete_reflection(id).is_ok()
+            {
+                idx.remove_reflection(id);
             }
         }
     }
 
     // Embed and store
-    let embedding = engine.embeddings().embed_single(briefing)?;
+    let emb = engine.embeddings().clone();
+    let text = briefing.to_string();
+    let embedding = tokio::task::spawn_blocking(move || emb.embed_single(&text)).await??;
     let id = uuid::Uuid::new_v4().to_string();
     engine
         .storage()
         .insert_reflection(&id, briefing, &tags, &embedding)?;
+    engine
+        .search()
+        .write()
+        .await
+        .insert_reflection(id, embedding);
 
     Ok(())
 }

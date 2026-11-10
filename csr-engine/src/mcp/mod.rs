@@ -200,7 +200,6 @@ pub struct CsrServer {
     embeddings: Arc<EmbeddingEngine>,
     search: Arc<RwLock<SearchEngine>>,
     projects_dir: PathBuf,
-    index_dir: PathBuf,
     db_path: String,
     task_manager: tasks::TaskManager,
 }
@@ -212,21 +211,16 @@ impl CsrServer {
         embeddings: Arc<EmbeddingEngine>,
         search: Arc<RwLock<SearchEngine>>,
         projects_dir: PathBuf,
-        index_dir: PathBuf,
     ) -> Self {
-        // Derive db_path from index_dir (sibling: index_dir/../csr-engine.db)
-        let db_path = index_dir
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join("csr-engine.db")
-            .to_string_lossy()
-            .to_string();
+        let db_path = storage
+            .path()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| ":memory:".to_string());
         Self {
             storage,
             embeddings,
             search,
             projects_dir,
-            index_dir,
             db_path,
             task_manager: tasks::TaskManager::new(),
         }
@@ -236,27 +230,6 @@ impl CsrServer {
     /// so the count can't silently drift from what docs claim.
     pub fn tool_count() -> usize {
         Self::tool_router().list_all().len()
-    }
-
-    /// Persist the reflection `store_reflection` just added. Reflections only:
-    /// this server usually runs inside the daemon, whose chunk side is dirty
-    /// from watcher imports, and a full dump here rewrote the 1.7 GB chunk
-    /// index on every stored reflection. The daemon's watcher persists the
-    /// chunk side on its own timer.
-    async fn flush_index(&self) {
-        let mut idx = self.search.write().await;
-        if idx.is_reflection_dirty() {
-            let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
-            let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
-            if let Err(e) = idx.dump_to_disk_scoped(
-                &self.index_dir,
-                chunk_count,
-                refl_count,
-                crate::search::DumpScope::ReflectionsOnly,
-            ) {
-                tracing::warn!(error = %e, "failed to flush HNSW index after store_reflection");
-            }
-        }
     }
 
     // ─── Core tools (3) ───
@@ -329,9 +302,6 @@ impl CsrServer {
             &tags,
         )
         .await;
-
-        // Flush index to disk so the new reflection persists for other processes (H-3)
-        self.flush_index().await;
 
         tool_result(result)
     }
@@ -840,13 +810,8 @@ impl ServerHandler for CsrServer {
     ) -> Result<ReadResourceResult, rmcp::ErrorData> {
         match request.uri.as_str() {
             "status://system-health" => {
-                let text = resources::system_health(
-                    &self.storage,
-                    &self.search,
-                    &self.db_path,
-                    &self.index_dir.to_string_lossy(),
-                )
-                .await;
+                let text =
+                    resources::system_health(&self.storage, &self.search, &self.db_path).await;
                 Ok(ReadResourceResult::new(vec![ResourceContents::text(
                     text,
                     &request.uri,

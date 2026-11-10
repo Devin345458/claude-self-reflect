@@ -1,8 +1,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::time::Duration;
 
-use hnsw_rs::hnsw::Hnsw;
-use hnsw_rs::prelude::DistCosine;
+use csr_engine::search::VectorStore;
 
 // ─── Embedding Benchmark ───
 
@@ -50,19 +49,17 @@ fn bench_embed_single(c: &mut Criterion) {
     group.finish();
 }
 
-// ─── HNSW Search Benchmark ───
+// ─── Exact Vector Search Benchmark ───
 
-fn bench_search_hnsw(c: &mut Criterion) {
-    let mut group = c.benchmark_group("hnsw_search");
-    group.sample_size(100);
+fn bench_search_exact(c: &mut Criterion) {
+    let mut group = c.benchmark_group("exact_search");
+    group.sample_size(30);
 
-    for &size in &[1_000, 10_000] {
-        // Build index with random 384-dim vectors
-        let index: Hnsw<f32, DistCosine> = Hnsw::new(16, size, 16, 200, DistCosine {});
-
+    for &size in &[10_000usize, 100_000, 1_000_000] {
+        let mut store = VectorStore::with_capacity(size);
         let mut rng_state: u64 = 42;
-        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(size);
-        for _ in 0..size {
+        let mut first: Vec<f32> = Vec::new();
+        for i in 0..size {
             let vec: Vec<f32> = (0..384)
                 .map(|_| {
                     // Simple LCG pseudo-random
@@ -70,31 +67,15 @@ fn bench_search_hnsw(c: &mut Criterion) {
                     ((rng_state >> 33) as f32) / (u32::MAX as f32) - 0.5
                 })
                 .collect();
-            vectors.push(vec);
+            if i == 0 {
+                first = vec.clone();
+            }
+            store.upsert(format!("id-{i}"), &vec);
         }
-
-        for (i, vec) in vectors.iter().enumerate() {
-            index.insert((vec, i));
-        }
-
-        // Query vector (first vector — should find itself as top match)
-        let query = &vectors[0];
-
-        group.bench_with_input(BenchmarkId::new("search_top5", size), &size, |b, _| {
-            b.iter(|| {
-                let results = index.search(query, 5, 100);
-                assert!(!results.is_empty());
-            });
-        });
-
-        group.bench_with_input(BenchmarkId::new("search_top20", size), &size, |b, _| {
-            b.iter(|| {
-                let results = index.search(query, 20, 100);
-                assert!(!results.is_empty());
-            });
+        group.bench_with_input(BenchmarkId::new("top10", size), &size, |b, _| {
+            b.iter(|| store.search(&first, 10, 0.0));
         });
     }
-
     group.finish();
 }
 
@@ -202,7 +183,7 @@ fn bench_sqlite_operations(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_embed_single,
-    bench_search_hnsw,
+    bench_search_exact,
     bench_jsonl_parse,
     bench_sqlite_operations,
 );

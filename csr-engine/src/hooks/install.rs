@@ -61,7 +61,7 @@ fn generate_hook_config(binary_path: &str) -> serde_json::Value {
             "SessionStart": [
                 {
                     "matcher": "startup|resume|compact",
-                    "hooks": [{"type": "command", "command": format!("{} hook session-start", binary_path)}]
+                    "hooks": [{"type": "command", "command": format!("{} hook session-start", binary_path), "timeout": super::installed_timeout_secs("session-start")}]
                 },
                 {
                     "matcher": "startup|resume",
@@ -69,26 +69,25 @@ fn generate_hook_config(binary_path: &str) -> serde_json::Value {
                         "type": "command",
                         "command": format!("{} hook session-briefing", binary_path),
                         "async": true,
-                        "timeout": super::SESSION_BRIEFING_TIMEOUT_SECS,
-                        "statusMessage": "CSR generating session briefing (async)..."
+                        "timeout": super::installed_timeout_secs("session-briefing")
                     }]
                 }
             ],
             "SessionEnd": [{
-                "hooks": [{"type": "command", "command": format!("{} hook session-end", binary_path)}]
+                "hooks": [{"type": "command", "command": format!("{} hook session-end", binary_path), "timeout": super::installed_timeout_secs("session-end")}]
             }],
             "PreCompact": [{
-                "hooks": [{"type": "command", "command": format!("{} hook precompact", binary_path)}]
+                "hooks": [{"type": "command", "command": format!("{} hook precompact", binary_path), "timeout": super::installed_timeout_secs("precompact")}]
             }],
             "Stop": [{
-                "hooks": [{"type": "command", "command": format!("{} hook stop", binary_path)}]
+                "hooks": [{"type": "command", "command": format!("{} hook stop", binary_path), "timeout": super::installed_timeout_secs("stop")}]
             }],
             "PostToolUse": [{
                 "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-                "hooks": [{"type": "command", "command": format!("{} hook post-tool-use", binary_path)}]
+                "hooks": [{"type": "command", "command": format!("{} hook post-tool-use", binary_path), "timeout": super::installed_timeout_secs("post-tool-use")}]
             }],
             "UserPromptSubmit": [{
-                "hooks": [{"type": "command", "command": format!("{} hook prompt-submit", binary_path)}]
+                "hooks": [{"type": "command", "command": format!("{} hook prompt-submit", binary_path), "timeout": super::installed_timeout_secs("prompt-submit")}]
             }]
         }
     })
@@ -383,9 +382,39 @@ mod tests {
             .unwrap()
             .contains("session-briefing"));
         assert!(briefing_hook["hooks"][0]["async"].as_bool().unwrap());
-        assert_eq!(briefing_hook["hooks"][0]["timeout"].as_u64().unwrap(), 150);
+        // The daemon runs the briefing in the background; the client only
+        // waits for the acknowledgement.
+        assert_eq!(
+            briefing_hook["hooks"][0]["timeout"].as_u64().unwrap(),
+            super::super::installed_timeout_secs("session-briefing")
+        );
         // Briefing only on startup|resume (not compact — compact doesn't need fresh briefing)
         assert_eq!(briefing_hook["matcher"].as_str().unwrap(), "startup|resume");
+    }
+
+    #[test]
+    fn every_installed_hook_has_a_timeout_above_its_client_budget() {
+        let config = generate_hook_config("/bin/csr-engine");
+        let mut seen = 0;
+        for (_event, groups) in config["hooks"].as_object().unwrap() {
+            for group in groups.as_array().unwrap() {
+                for hook in group["hooks"].as_array().unwrap() {
+                    let cmd = hook["command"].as_str().unwrap();
+                    let name = cmd.rsplit(' ').next().unwrap();
+                    let timeout = hook["timeout"]
+                        .as_u64()
+                        .unwrap_or_else(|| panic!("{cmd}: no timeout"));
+                    // Client: 1s connect + 15s reply or 3s acknowledgement.
+                    let budget = match crate::daemon::hook_server::hook_kind(name) {
+                        Some(crate::daemon::hook_server::HookKind::Reply) => 16,
+                        _ => 4,
+                    };
+                    assert!(timeout > budget, "{cmd}: timeout {timeout}s");
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(seen, 7, "one entry per installed hook");
     }
 
     /// The installers tell a user whose hooks point at a different copy of
