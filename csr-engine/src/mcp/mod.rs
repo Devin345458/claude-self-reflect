@@ -3,6 +3,7 @@ pub mod elicitation;
 pub mod http;
 pub mod resources;
 pub mod scope;
+pub mod session;
 pub mod tasks;
 pub mod tools;
 
@@ -202,6 +203,10 @@ pub struct CsrServer {
     projects_dir: PathBuf,
     db_path: String,
     task_manager: tasks::TaskManager,
+    /// This MCP session's client directory (its first MCP root). Shared by
+    /// clones within a session; [`Self::for_new_session`] gives each new
+    /// HTTP session its own.
+    session: Arc<session::SessionDir>,
 }
 
 #[tool_router]
@@ -223,6 +228,16 @@ impl CsrServer {
             projects_dir,
             db_path,
             task_manager: tasks::TaskManager::new(),
+            session: session::SessionDir::new(),
+        }
+    }
+
+    /// A handler for a new MCP session: shares storage, embeddings and the
+    /// vectors, but starts with no client directory of its own.
+    pub fn for_new_session(&self) -> Self {
+        Self {
+            session: session::SessionDir::new(),
+            ..self.clone()
         }
     }
 
@@ -687,6 +702,27 @@ fn tool_result(result: anyhow::Result<String>) -> Result<CallToolResult, rmcp::E
 
 #[tool_handler]
 impl ServerHandler for CsrServer {
+    /// Every tool call runs with this session's client directory visible to
+    /// scope resolution, so "the current project" is the caller's project,
+    /// not the daemon's. Replaces the call_tool `#[tool_handler]` generates.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let dir = self.session.resolve(&context.peer).await;
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        crate::search::cross_project::with_session_client_dir(dir, Self::tool_router().call(tcc))
+            .await
+    }
+
+    async fn on_roots_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<RoleServer>,
+    ) {
+        self.session.invalidate().await;
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -822,5 +858,46 @@ impl ServerHandler for CsrServer {
                 None,
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    fn server() -> CsrServer {
+        CsrServer::new(
+            Arc::new(Storage::open_memory().unwrap()),
+            Arc::new(EmbeddingEngine::new().unwrap()),
+            Arc::new(RwLock::new(SearchEngine::new(4))),
+            PathBuf::from("/tmp"),
+        )
+    }
+
+    /// Clones inside one session (task execution clones the handler) share
+    /// the session's directory; a new HTTP session starts without one.
+    #[tokio::test]
+    async fn each_http_session_gets_its_own_directory() {
+        let base = server();
+        let a = base.for_new_session();
+        let a_clone = a.clone();
+        let b = base.for_new_session();
+        let got = a
+            .session
+            .resolve_with(|| async { Some("/Users/x/p/alpha".to_string()) })
+            .await;
+        assert_eq!(got.as_deref(), Some("/Users/x/p/alpha"));
+        let shared = a_clone
+            .session
+            .resolve_with(|| async { Some("/never/asked".to_string()) })
+            .await;
+        assert_eq!(shared.as_deref(), Some("/Users/x/p/alpha"));
+        let other = b
+            .session
+            .resolve_with(|| async { Some("/Users/x/p/beta".to_string()) })
+            .await;
+        assert_eq!(other.as_deref(), Some("/Users/x/p/beta"));
+        assert!(!Arc::ptr_eq(&a.session, &b.session));
+        assert!(!Arc::ptr_eq(&a.session, &base.session));
     }
 }

@@ -51,8 +51,8 @@ Anti-goals: a hook that blocks Claude Code; a failure that is silent to the user
 
 ## Known gaps
 
-- MCP project scoping reads `MCP_CLIENT_CWD`/`CLAUDE_PROJECT_DIR` from the daemon's
-  environment, not the session's (true since MCP moved to HTTP on 2026-10-30).
+- (Fixed 2026-11-10) MCP project scoping read the daemon's environment. Each session now
+  scopes to its first MCP root; see `mcp/session.rs`.
 - The session-start `systemMessage` for a down daemon is emitted (tested) but has not been
   seen rendering in Claude Code.
 

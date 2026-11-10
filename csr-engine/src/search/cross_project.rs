@@ -28,25 +28,46 @@ pub fn resolve_project_from_cwd(cwd: &str) -> Option<String> {
     Some(dir_name)
 }
 
-/// Resolve the current project from the `MCP_CLIENT_CWD` environment variable.
-///
-/// Claude Code sets `MCP_CLIENT_CWD` to the user's working directory when invoking
-/// MCP tools. We extract the project name using `resolve_project_from_cwd`.
-///
-/// Returns `None` if the env var is not set.
-pub fn resolve_current_project() -> Option<String> {
-    let cwd = std::env::var("MCP_CLIENT_CWD").ok()?;
-    resolve_project_from_cwd(&cwd)
+tokio::task_local! {
+    /// The calling MCP session's directory, set for the duration of one tool
+    /// call by [`with_session_client_dir`].
+    static SESSION_CLIENT_DIR: String;
 }
 
-/// The directory the MCP client is working in: `MCP_CLIENT_CWD` when a client
-/// sets it, otherwise `CLAUDE_PROJECT_DIR`. Claude Code exports the second to
-/// every stdio MCP server it starts and has never set the first, so until this
-/// fallback an unscoped search from Claude Code always ran across all projects.
+/// Run `fut` with `dir` as the client directory every scope lookup inside it
+/// sees. `None` runs `fut` unchanged (lookups fall back to the environment).
+/// The daemon's MCP server wraps every tool call in this with the session's
+/// MCP root (see `crate::mcp::session`).
+pub async fn with_session_client_dir<F: std::future::Future>(
+    dir: Option<String>,
+    fut: F,
+) -> F::Output {
+    match dir.filter(|d| !d.trim().is_empty()) {
+        Some(d) => SESSION_CLIENT_DIR.scope(d, fut).await,
+        None => fut.await,
+    }
+}
+
+/// The project of the client's directory (see [`resolve_client_dir`]).
+pub fn resolve_current_project() -> Option<String> {
+    resolve_project_from_cwd(&resolve_client_dir()?)
+}
+
+/// The directory the MCP client is working in, first match wins:
+/// 1. the calling MCP session's root ([`with_session_client_dir`]);
+/// 2. `MCP_CLIENT_CWD`, then `CLAUDE_PROJECT_DIR`, from the session's
+///    forwarded environment inside a hook, else this process's environment.
+///
+/// Claude Code exports `CLAUDE_PROJECT_DIR` to stdio MCP servers and has never
+/// set `MCP_CLIENT_CWD`. Over HTTP neither reaches the daemon, whose own
+/// environment belongs to no session; the session root is what scopes there.
 pub fn resolve_client_dir() -> Option<String> {
+    if let Ok(dir) = SESSION_CLIENT_DIR.try_with(|d| d.clone()) {
+        return Some(dir);
+    }
     client_dir_from(
-        std::env::var("MCP_CLIENT_CWD").ok(),
-        std::env::var("CLAUDE_PROJECT_DIR").ok(),
+        crate::hooks::context::env_var("MCP_CLIENT_CWD"),
+        crate::hooks::context::env_var("CLAUDE_PROJECT_DIR"),
     )
 }
 
@@ -63,7 +84,7 @@ fn client_dir_from(
 
 /// Normalize a project scope parameter.
 ///
-/// - `None` → auto-detect from `MCP_CLIENT_CWD`
+/// - `None` → auto-detect from the client directory ([`resolve_client_dir`])
 /// - `Some("all")` (any case) → `None` (search all projects)
 /// - `Some(name)` → `Some(name)` (specific project)
 ///
@@ -192,5 +213,59 @@ mod tests {
     fn test_resolve_from_cwd_no_projects_segment() {
         let result = resolve_project_from_cwd("/tmp/something/mydir");
         assert_eq!(result, Some("mydir".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_session_directory_wins_and_stays_inside_its_call() {
+        let a = with_session_client_dir(Some("/Users/x/PhpstormProjects/alpha".into()), async {
+            (
+                resolve_client_dir(),
+                resolve_current_project(),
+                normalize_project_scope(None),
+            )
+        })
+        .await;
+        assert_eq!(a.0.as_deref(), Some("/Users/x/PhpstormProjects/alpha"));
+        assert_eq!(a.1.as_deref(), Some("alpha"));
+        assert_eq!(a.2, (Some("alpha".to_string()), "alpha".to_string()));
+
+        // An explicit project still wins over the session's own.
+        let explicit =
+            with_session_client_dir(Some("/Users/x/PhpstormProjects/alpha".into()), async {
+                normalize_project_scope(Some("beta"))
+            })
+            .await;
+        assert_eq!(explicit.0.as_deref(), Some("beta"));
+
+        // Outside the call the session directory is gone.
+        let outside = resolve_client_dir();
+        assert_ne!(outside.as_deref(), Some("/Users/x/PhpstormProjects/alpha"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_sessions_never_see_each_others_directory() {
+        let run = |dir: &'static str| {
+            tokio::spawn(with_session_client_dir(Some(dir.to_string()), async move {
+                let mut seen = Vec::new();
+                for _ in 0..50 {
+                    seen.push(resolve_current_project());
+                    tokio::task::yield_now().await;
+                }
+                seen
+            }))
+        };
+        let (a, b) = (run("/Users/x/p/alpha"), run("/Users/x/p/beta"));
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+        assert!(a.iter().all(|p| p.as_deref() == Some("alpha")));
+        assert!(b.iter().all(|p| p.as_deref() == Some("beta")));
+    }
+
+    #[tokio::test]
+    async fn no_session_directory_falls_back_to_the_environment() {
+        let inside = with_session_client_dir(None, async { resolve_client_dir() }).await;
+        assert_eq!(inside, resolve_client_dir());
+        let blank =
+            with_session_client_dir(Some("  ".into()), async { resolve_client_dir() }).await;
+        assert_eq!(blank, resolve_client_dir());
     }
 }

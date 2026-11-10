@@ -58,23 +58,41 @@ pub fn parse_listen_addr(raw: &str) -> Result<SocketAddr> {
     Ok(addr)
 }
 
+/// A handler that can make the handler for one new MCP session.
+///
+/// The default clones, which shares everything. A handler with per-session
+/// state (the session's client directory, for [`crate::mcp::CsrServer`])
+/// overrides it so that state starts fresh for each session.
+pub trait SessionHandler: ServerHandler + Clone + Send + Sync + 'static {
+    fn for_new_session(&self) -> Self {
+        self.clone()
+    }
+}
+
+impl SessionHandler for crate::mcp::CsrServer {
+    fn for_new_session(&self) -> Self {
+        crate::mcp::CsrServer::for_new_session(self)
+    }
+}
+
 /// Build the router that mounts the MCP endpoint at [`ENDPOINT_PATH`].
 ///
-/// The factory clones `handler` per session. Clone has to be cheap and has to
-/// share state. That is what makes this one index load instead of many.
-pub fn router<S>(handler: S) -> axum::Router
-where
-    S: ServerHandler + Clone + Send + Sync + 'static,
-{
+/// The factory makes one handler per session with
+/// [`SessionHandler::for_new_session`]. It has to be cheap and share the heavy
+/// state. That is what makes this one load of the vectors instead of many.
+pub fn router<S: SessionHandler>(handler: S) -> axum::Router {
     router_with_config(handler, StreamableHttpServerConfig::default())
 }
 
-fn router_with_config<S>(handler: S, config: StreamableHttpServerConfig) -> axum::Router
-where
-    S: ServerHandler + Clone + Send + Sync + 'static,
-{
-    let service: StreamableHttpService<S, LocalSessionManager> =
-        StreamableHttpService::new(move || Ok(handler.clone()), Default::default(), config);
+fn router_with_config<S: SessionHandler>(
+    handler: S,
+    config: StreamableHttpServerConfig,
+) -> axum::Router {
+    let service: StreamableHttpService<S, LocalSessionManager> = StreamableHttpService::new(
+        move || Ok(handler.for_new_session()),
+        Default::default(),
+        config,
+    );
     axum::Router::new().nest_service(ENDPOINT_PATH, service)
 }
 
@@ -87,10 +105,7 @@ pub async fn bind(addr: SocketAddr) -> Result<TcpListener> {
 }
 
 /// Serve `handler` over MCP Streamable HTTP until Ctrl+C.
-pub async fn serve<S>(handler: S, listener: TcpListener) -> Result<()>
-where
-    S: ServerHandler + Clone + Send + Sync + 'static,
-{
+pub async fn serve<S: SessionHandler>(handler: S, listener: TcpListener) -> Result<()> {
     serve_until(handler, listener, async {
         let _ = tokio::signal::ctrl_c().await;
     })
@@ -107,7 +122,7 @@ where
 /// would wait on the clients instead of returning.
 pub async fn serve_until<S, F>(handler: S, listener: TcpListener, shutdown: F) -> Result<()>
 where
-    S: ServerHandler + Clone + Send + Sync + 'static,
+    S: SessionHandler,
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let config = StreamableHttpServerConfig::default();
@@ -183,6 +198,7 @@ mod tests {
     struct ProbeServer;
 
     impl ServerHandler for ProbeServer {}
+    impl SessionHandler for ProbeServer {}
 
     #[tokio::test]
     async fn completes_an_initialize_handshake_over_http() {

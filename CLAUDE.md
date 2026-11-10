@@ -33,6 +33,10 @@ This is a hard fork; upstream compatibility is a non-goal.
 - Handlers print with `hook_print!`/`hook_println!` and read env with
   `hooks::context::env_var`, never `println!`/`std::env::var`: they run
   inside the daemon for another session.
+- MCP scope is per session: on a session's first tool call the server asks
+  the client for its MCP roots (Claude Code returns the session's working
+  directory) and scopes "current project" to it (`mcp/session.rs`). Env vars
+  `MCP_CLIENT_CWD`/`CLAUDE_PROJECT_DIR` are only the fallback.
 - Install: `scripts/install-local.sh` (build, back up, bootout, sign, swap,
   bootstrap, ping). `--rollback <backup dir>` reverses it.
 - Health: `csr-engine daemon-ping`. Design: `docs/superpowers/specs/2026-11-10-daemon-owned-index-design.md`.
@@ -99,7 +103,7 @@ csr_resolve           — Record verified verdicts (resolved/still_open/regresse
 # Build
 cd csr-engine && cargo build --release
 
-# Test (1019 unit + 45 hooks integration + 58 integration)
+# Test (1028 unit + 45 hooks integration + 58 integration)
 cargo test
 cargo test --test hooks_integration
 cargo test --test integration
