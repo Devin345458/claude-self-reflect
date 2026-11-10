@@ -111,6 +111,10 @@ const MAX_TIMING_LOG_BYTES: u64 = 10 * 1024 * 1024;
 /// concurrent rotation races lose a rename harmlessly, IO errors are swallowed
 /// (logging must never fail a hook).
 pub fn append_timing_line(line: &str) {
+    // Unit tests run handlers that log; keep them out of the user's live log.
+    if cfg!(test) && std::env::var_os("CSR_TIMING_LOG").is_none() {
+        return;
+    }
     let Some(log_path) = default_log_path() else {
         return;
     };

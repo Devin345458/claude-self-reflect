@@ -242,4 +242,23 @@ mod tests {
         assert_eq!(extract_ms("total=ms", "total="), None);
         assert_eq!(extract_ms("nothing", "total="), None);
     }
+
+    #[test]
+    fn parses_the_daemon_hook_line() {
+        let line = "2026-11-10T19:07:05Z CSR hook stop [shopr]: hook=838ms total=838ms (daemon)";
+        match parse_line(line) {
+            Some(Entry::Hook {
+                name,
+                project,
+                total_ms,
+                hook_ms,
+                ..
+            }) => {
+                assert_eq!(name, "stop");
+                assert_eq!(project.as_deref(), Some("shopr"));
+                assert_eq!((total_ms, hook_ms), (838, 838));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
 }

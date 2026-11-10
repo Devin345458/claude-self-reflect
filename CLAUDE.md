@@ -8,12 +8,34 @@ Single Rust binary (`csr-engine`). No Python, no Docker, no Qdrant.
 csr-engine (44MB)
   ├── MCP server (rmcp, 15 tools, stdio or Streamable HTTP)
   ├── Embeddings (FastEmbed, 384-dim, local)
-  ├── Search (HNSW, <1ms p95)
+  ├── Search (exact, in memory, ~15 ms over 900k vectors)
   ├── Storage (SQLite)
   ├── AST analysis (ast-grep, 6 languages)
-  ├── 6 Claude Code hooks
+  ├── 7 Claude Code hooks (thin clients of the daemon)
   └── 3-layer enrichment pipeline
 ```
+
+## Process Model (fork, 2026-11-10)
+
+This is a hard fork; upstream compatibility is a non-goal.
+
+- **The daemon is the only process that holds vectors.** `csr-engine daemon
+  --serve-http 127.0.0.1:7391` (LaunchAgent `com.devin.csr-daemon`) binds its
+  MCP port and `daemon.sock` (beside the database) first, loads every vector
+  from SQLite into memory (3 s warm), then syncs rows other processes write
+  every 30 s. SQLite is the only thing on disk: no index files, no lock, no
+  compaction.
+- **Hooks are thin clients.** `csr-engine hook <name>` forwards stdin, cwd and
+  `CSR_*` env over the socket and prints the reply (about 11 MB, under 200 ms).
+  prompt-submit and session-start wait up to 15 s for the injection; the rest
+  are acknowledged and queued. Daemon down: exit 0, session-start prints a
+  `systemMessage`. `CSR_HOOK_LOCAL=1` runs a handler in-process for debugging.
+- Handlers print with `hook_print!`/`hook_println!` and read env with
+  `hooks::context::env_var`, never `println!`/`std::env::var`: they run
+  inside the daemon for another session.
+- Install: `scripts/install-local.sh` (build, back up, bootout, sign, swap,
+  bootstrap, ping). `--rollback <backup dir>` reverses it.
+- Health: `csr-engine daemon-ping`. Design: `docs/superpowers/specs/2026-11-10-daemon-owned-index-design.md`.
 
 ## Corpus Sources (v9.4+)
 
@@ -77,7 +99,7 @@ csr_resolve           — Record verified verdicts (resolved/still_open/regresse
 # Build
 cd csr-engine && cargo build --release
 
-# Test (615 unit + 45 hooks integration + 61 integration)
+# Test (1019 unit + 45 hooks integration + 58 integration)
 cargo test
 cargo test --test hooks_integration
 cargo test --test integration
@@ -95,7 +117,6 @@ cargo bench --bench spike_bench
 |-------|---------|---------|
 | rmcp | 1.6 | MCP protocol (tool annotations, macros) |
 | fastembed | 5.9 | Local embeddings |
-| hnsw_rs | 0.3 | Vector search |
 | rusqlite | 0.38 | SQLite storage |
 | ast-grep-core | 0.40 | AST analysis |
 | sonic-rs | 0.3 | Fast JSON parsing |
@@ -109,7 +130,7 @@ cargo bench --bench spike_bench
 - **fastembed**: Requires `aarch64` Rust — no x86_64-apple-darwin ONNX binaries
 - **rusqlite 0.38**: No `ToSql` for `usize` — cast to `i64`
 - **Storage thread safety**: Wrap `Connection` in `std::sync::Mutex`
-- **EmbeddingEngine**: `embed` requires `&mut self`, wrap in `Mutex`
+- **EmbeddingEngine**: methods take `&self`; an internal Mutex serializes embeds (one at a time per process)
 - **Hooks**: All use catch-all wrappers — never block Claude Code
 - **System sqlite3 (macOS)**: cannot load fts5 — CLI inspection silently skips `chunks_fts` (integrity checks look ~10x faster than the bundled engine's). Use `csr-engine status --deep` or Homebrew sqlite3.
 - **integrity_check**: never call raw `PRAGMA integrity_check` on the hot path — ~10s CPU on multi-GB DBs; use `Storage::integrity_check_cached` (meta-table cache, daemon refreshes)
@@ -117,7 +138,7 @@ cargo bench --bench spike_bench
 
 ## Hooks
 
-6 hooks fire at strategic moments:
+7 hooks fire at strategic moments (all served by the daemon; see Process Model):
 
 | Hook | When | What |
 |------|------|------|
