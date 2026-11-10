@@ -43,8 +43,18 @@ Anti-goals: a hook that blocks Claude Code; a failure that is silent to the user
    catches up new embedding rows by rowid and reconciles deletions by count.
 5. **Daemon priority.** The LaunchAgent no longer runs at background priority, since hooks now
    wait on it.
-6. **Install path.** `setup` registers MCP over HTTP only. A local install script builds, signs,
+6. **Two embedding models in the daemon.** Each model serializes its callers. With one, every
+   prompt-submit queued behind the watcher's chunk embeds (0.9 to 1.9 s live). Background loops
+   get their own model; hooks and MCP keep the other. Live prompt-submit: 54 to 104 ms.
+7. **Install path.** `setup` registers MCP over HTTP only. A local install script builds, signs,
    and swaps the binary with bootout and bootstrap.
+
+## Known gaps
+
+- MCP project scoping reads `MCP_CLIENT_CWD`/`CLAUDE_PROJECT_DIR` from the daemon's
+  environment, not the session's (true since MCP moved to HTTP on 2026-10-30).
+- The session-start `systemMessage` for a down daemon is emitted (tested) but has not been
+  seen rendering in Claude Code.
 
 ## Left to the builder
 
