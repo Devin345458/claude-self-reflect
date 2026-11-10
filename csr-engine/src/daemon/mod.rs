@@ -154,11 +154,8 @@ impl Daemon {
         // still gets its MCP tools and its hooks connect. Requests that need
         // vectors wait for the load (it holds the search write lock).
         let hook_listener = hook_server::bind(&self.hook_socket)?;
-        let hook_handle = {
-            let engine = self.engine.clone();
-            let shutdown = shutdown.clone();
-            tokio::spawn(hook_server::serve(hook_listener, engine, shutdown))
-        };
+        let hook_thread =
+            hook_server::spawn_dedicated(hook_listener, self.engine.clone(), shutdown.clone())?;
         tracing::info!(socket = %self.hook_socket.display(), "hook socket listening");
 
         let mcp_http_handle = match self.mcp_http_addr {
@@ -449,7 +446,8 @@ impl Daemon {
         if let Some(handle) = mcp_http_handle {
             handle.abort();
         }
-        hook_handle.abort();
+        // The socket thread sees the shutdown flag within half a second.
+        let _ = tokio::task::spawn_blocking(move || hook_thread.join()).await;
         let _ = std::fs::remove_file(&self.hook_socket);
 
         tracing::info!("daemon stopped");

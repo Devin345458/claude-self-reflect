@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
 use tokio::sync::Semaphore;
 
 use crate::engine::Engine;
@@ -58,7 +58,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Client: how long a reply hook waits for its injection.
 const REPLY_BUDGET: Duration = Duration::from_secs(15);
 /// Client: how long a queued hook waits for the acknowledgement.
-const ACK_BUDGET: Duration = Duration::from_secs(3);
+const ACK_BUDGET: Duration = Duration::from_secs(5);
+/// How often the accept loop looks at the shutdown flag.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(500);
 
 /// What the client sends.
 #[derive(Debug, Serialize, Deserialize)]
@@ -128,7 +130,10 @@ pub fn socket_path_for(db_path: &Path) -> PathBuf {
 /// Bind the hook socket, replacing a stale one. Only one daemon runs at a time
 /// (it holds `daemon.lock` before calling this), so an existing socket file is
 /// always left over from a previous run.
-pub fn bind(path: &Path) -> Result<UnixListener> {
+///
+/// Returns a std listener so the caller can hand it to whichever runtime
+/// serves it (see [`spawn_dedicated`]).
+pub fn bind(path: &Path) -> Result<std::os::unix::net::UnixListener> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -137,14 +142,34 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).context("removing stale hook socket"),
     }
-    let listener = UnixListener::bind(path)
+    let listener = std::os::unix::net::UnixListener::bind(path)
         .with_context(|| format!("binding hook socket {}", path.display()))?;
-    #[cfg(unix)]
+    listener.set_nonblocking(true)?;
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(listener)
+}
+
+/// Serve the hook socket on a thread of its own, with its own small runtime,
+/// so accepting a connection and acknowledging a queued hook never wait on
+/// the daemon's workers. Hook handlers do blocking work (SQLite behind one
+/// mutex, file reads); when enough of them ran at once, a stop hook's
+/// acknowledgement took over 3 s on 2026-11-10. The handlers themselves still
+/// run on the runtime this is called from.
+pub fn spawn_dedicated(
+    listener: std::os::unix::net::UnixListener,
+    engine: Engine,
+    shutdown: Arc<AtomicBool>,
+) -> Result<std::thread::JoinHandle<()>> {
+    let work = tokio::runtime::Handle::current();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    Ok(std::thread::Builder::new()
+        .name("csr-hook-socket".into())
+        .spawn(move || rt.block_on(serve(listener, engine, shutdown, work)))?)
 }
 
 struct Lanes {
@@ -153,17 +178,31 @@ struct Lanes {
     queued: AtomicUsize,
 }
 
-/// Accept hook connections until `shutdown` is set.
-pub async fn serve(listener: UnixListener, engine: Engine, shutdown: Arc<AtomicBool>) {
+/// Accept hook connections until `shutdown` is set. Connections are handled
+/// on the current runtime; hook handlers are spawned onto `work`.
+pub async fn serve(
+    listener: std::os::unix::net::UnixListener,
+    engine: Engine,
+    shutdown: Arc<AtomicBool>,
+    work: tokio::runtime::Handle,
+) {
+    let listener = match tokio::net::UnixListener::from_std(listener) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(error = %e, "hook socket could not be registered with the runtime");
+            return;
+        }
+    };
     let lanes = Arc::new(Lanes {
         fast: Semaphore::new(FAST_LANE),
         slow: Semaphore::new(SLOW_LANE),
         queued: AtomicUsize::new(0),
     });
     while !shutdown.load(Ordering::SeqCst) {
-        let stream = match listener.accept().await {
-            Ok((stream, _)) => stream,
-            Err(e) => {
+        let stream = match tokio::time::timeout(SHUTDOWN_POLL, listener.accept()).await {
+            Err(_) => continue,
+            Ok(Ok((stream, _))) => stream,
+            Ok(Err(e)) => {
                 tracing::warn!(error = %e, "hook socket accept failed");
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
@@ -171,8 +210,9 @@ pub async fn serve(listener: UnixListener, engine: Engine, shutdown: Arc<AtomicB
         };
         let engine = engine.clone();
         let lanes = lanes.clone();
+        let work = work.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, engine, lanes).await {
+            if let Err(e) = handle_connection(stream, engine, lanes, work).await {
                 tracing::debug!(error = %e, "hook connection ended with an error");
             }
         });
@@ -183,6 +223,7 @@ async fn handle_connection(
     mut stream: UnixStream,
     engine: Engine,
     lanes: Arc<Lanes>,
+    work: tokio::runtime::Handle,
 ) -> Result<()> {
     let mut raw = Vec::new();
     tokio::time::timeout(
@@ -200,7 +241,7 @@ async fn handle_connection(
         }
     } else {
         match serde_json::from_slice::<HookRequest>(&raw) {
-            Ok(req) => answer(req, &engine, &lanes).await,
+            Ok(req) => answer(req, &engine, &lanes, &work).await,
             Err(e) => HookReply {
                 error: Some(format!("bad request: {e}")),
                 ..Default::default()
@@ -213,7 +254,12 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn answer(req: HookRequest, engine: &Engine, lanes: &Arc<Lanes>) -> HookReply {
+async fn answer(
+    req: HookRequest,
+    engine: &Engine,
+    lanes: &Arc<Lanes>,
+    work: &tokio::runtime::Handle,
+) -> HookReply {
     match req.hook.as_str() {
         "ping" => {
             // Never wait on the vectors: a load holds the write lock for
@@ -238,7 +284,12 @@ async fn answer(req: HookRequest, engine: &Engine, lanes: &Arc<Lanes>) -> HookRe
             };
         }
         "reload-vectors" => {
-            return match engine.load_vectors().await {
+            let e = engine.clone();
+            let loaded = work
+                .spawn(async move { e.load_vectors().await })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("reload task failed: {e}")));
+            return match loaded {
                 Ok(()) => {
                     let idx = engine.search().read().await;
                     HookReply {
@@ -276,12 +327,21 @@ async fn answer(req: HookRequest, engine: &Engine, lanes: &Arc<Lanes>) -> HookRe
                 return HookReply::default();
             }
             let hook = req.hook.clone();
-            match tokio::time::timeout(REPLY_HOOK_LIMIT, run(req, engine.clone())).await {
-                Ok(stdout) => HookReply {
+            let task = work.spawn(run(req, engine.clone()));
+            let abort = task.abort_handle();
+            match tokio::time::timeout(REPLY_HOOK_LIMIT, task).await {
+                Ok(Ok(stdout)) => HookReply {
                     stdout,
                     ..Default::default()
                 },
+                Ok(Err(e)) => {
+                    crate::telemetry::append_timing_line(&format!(
+                        "CSR hook {hook}: task failed: {e}"
+                    ));
+                    HookReply::default()
+                }
                 Err(_) => {
+                    abort.abort();
                     crate::telemetry::append_timing_line(&format!(
                         "CSR hook {hook}: gave up after {}s in the daemon",
                         REPLY_HOOK_LIMIT.as_secs()
@@ -305,7 +365,7 @@ async fn answer(req: HookRequest, engine: &Engine, lanes: &Arc<Lanes>) -> HookRe
             let engine = engine.clone();
             let lanes = lanes.clone();
             let enqueued = Instant::now();
-            tokio::spawn(async move {
+            work.spawn(async move {
                 let lane = if kind == HookKind::QueuedSlow {
                     &lanes.slow
                 } else {
@@ -495,7 +555,13 @@ mod tests {
     async fn start(tmp: &tempfile::TempDir, engine: Engine) -> PathBuf {
         let sock = tmp.path().join("d.sock");
         let listener = bind(&sock).unwrap();
-        tokio::spawn(serve(listener, engine, Arc::new(AtomicBool::new(false))));
+        let work = tokio::runtime::Handle::current();
+        tokio::spawn(serve(
+            listener,
+            engine,
+            Arc::new(AtomicBool::new(false)),
+            work,
+        ));
         sock
     }
 
@@ -596,6 +662,45 @@ mod tests {
         assert!(
             waited >= VECTORS_READY_WAIT && waited < VECTORS_READY_WAIT + Duration::from_secs(3)
         );
+    }
+
+    /// The 2026-11-10 failure: handlers blocked the daemon's workers and a
+    /// stop hook's acknowledgement took over 3 s. On the dedicated socket
+    /// thread the acknowledgement must not wait for any worker.
+    #[test]
+    fn acks_arrive_while_every_worker_is_blocked() {
+        let work_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_in(&tmp);
+        let sock = tmp.path().join("d.sock");
+        let listener = bind(&sock).unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let _enter = work_rt.enter();
+            spawn_dedicated(listener, engine, shutdown.clone()).unwrap()
+        };
+        work_rt.spawn(async { std::thread::sleep(Duration::from_secs(3)) });
+        std::thread::sleep(Duration::from_millis(200));
+
+        let t = Instant::now();
+        let reply = send(
+            &sock,
+            &req("stop", serde_json::json!({})),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(reply.queued);
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "acknowledgement waited {:?} on a blocked worker",
+            t.elapsed()
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        thread.join().unwrap();
     }
 
     #[test]

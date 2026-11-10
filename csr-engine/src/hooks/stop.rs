@@ -509,11 +509,20 @@ pub async fn extract_and_store_episode(
     let project = resolve_project_from_cwd(&cwd.to_string_lossy());
     let project_name = project.as_deref().unwrap_or("unknown");
 
-    // Read transcript lines
-    let raw = std::fs::read_to_string(&tp)?;
-    let lines: Vec<&str> = raw.lines().collect();
-
-    let mut episode = extract_episode(&lines, session_id, project_name);
+    // Read and parse the transcript on the blocking pool: a long session's
+    // file is tens of MB (92 MB on 2026-11-10), and inside the daemon this
+    // ran on an async worker for over 10 s, starving the hook socket.
+    let mut episode = {
+        let tp = tp.clone();
+        let sid = session_id.to_string();
+        let proj = project_name.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Episode> {
+            let raw = std::fs::read_to_string(&tp)?;
+            let lines: Vec<&str> = raw.lines().collect();
+            Ok(extract_episode(&lines, &sid, &proj))
+        })
+        .await??
+    };
 
     // Authoritative on-disk task directory overrides transcript-mined todos
     // when present and non-empty (Claude Code's ~/.claude/tasks/<session_id>/).
