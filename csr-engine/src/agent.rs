@@ -4,10 +4,12 @@
 //! call goes through it, so it has to be up whenever Claude Code is. launchd
 //! starts it at login and restarts it if it exits.
 //!
-//! The agent runs at normal priority. It used to run as `ProcessType
-//! Background` with `LowPriorityIO`, which made its startup take 60 to 75 s
-//! against 4 s for the same work at normal priority; now that hooks wait on
-//! it, that would land on every prompt.
+//! The agent runs as `ProcessType Interactive`, the scheduling footing of an
+//! app. It used to run as `Background` with `LowPriorityIO` (startup 60 to
+//! 75 s against 4 s at normal priority). `Standard` still left it at priority
+//! 20 against 31 for ordinary processes, so during a load spike (iOS
+//! simulators booting, load average 340 on 2026-11-10) a prompt-submit took
+//! up to 8.5 s. Hooks wait on this process, and it is idle between bursts.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -81,7 +83,7 @@ pub fn render_plist(
 	<key>ThrottleInterval</key>
 	<integer>10</integer>
 	<key>ProcessType</key>
-	<string>Standard</string>
+	<string>Interactive</string>
 	<key>WorkingDirectory</key>
 	<string>{home}</string>
 	<key>StandardOutPath</key>
@@ -153,7 +155,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plist_runs_the_daemon_at_normal_priority_with_the_given_env() {
+    fn plist_runs_the_daemon_at_interactive_priority_with_the_given_env() {
         let env = BTreeMap::from([
             ("PATH".to_string(), "/a:/b".to_string()),
             (
@@ -174,7 +176,7 @@ mod tests {
             "<string>{}</string>",
             crate::setup::DAEMON_MCP_ADDR
         )));
-        assert!(p.contains("<key>ProcessType</key>\n\t<string>Standard</string>"));
+        assert!(p.contains("<key>ProcessType</key>\n\t<string>Interactive</string>"));
         assert!(!p.contains("Background"));
         assert!(!p.contains("LowPriorityIO"));
         assert!(
