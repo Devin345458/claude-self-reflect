@@ -161,7 +161,8 @@ impl Storage {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         Ok(conn.execute(
             "UPDATE chunks SET project_name = ?2
-             WHERE conversation_id = ?1 AND project_name != ?2 AND source = 'conversation'",
+             WHERE conversation_id = ?1 AND project_name != ?2
+               AND source IN ('conversation', 'sidechain')",
             rusqlite::params![conversation_id, project_name],
         )?)
     }

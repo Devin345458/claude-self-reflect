@@ -171,7 +171,8 @@ fn relabel_projects_in(
         let changes: Vec<(String, usize)> = storage.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT project_name, COUNT(*) FROM chunks
-                 WHERE conversation_id = ?1 AND project_name != ?2 AND source = 'conversation'
+                 WHERE conversation_id = ?1 AND project_name != ?2
+                   AND source IN ('conversation', 'sidechain')
                  GROUP BY project_name",
             )?;
             let rows = stmt
@@ -309,8 +310,14 @@ mod tests {
         .unwrap();
         s.mark_file_imported(&folder.join("conv-m.jsonl"), 1)
             .unwrap();
-        // A subagent transcript, also gone, labelled by its folder name.
-        s.insert_chunk(&chunk("g1", "agent-1", "subagents"), &[0.1; 384])
+        // A subagent transcript, also gone, labelled by its folder name and
+        // stored as a sidechain, the way the importer stores subagent chunks.
+        let mut g = chunk("g1", "agent-1", "subagents");
+        g.is_sidechain = true;
+        s.insert_chunk_with_source(&g, &[0.1; 384], "sidechain")
+            .unwrap();
+        // A plan chunk under the same conversation id is never relabelled.
+        s.insert_chunk_with_source(&chunk("p1", "agent-1", "subagents"), &[0.1; 384], "plan")
             .unwrap();
         s.mark_file_imported(&folder.join("conv-m/subagents/agent-1.jsonl"), 1)
             .unwrap();
@@ -323,7 +330,16 @@ mod tests {
         let done = relabel_projects_in(&s, tmp.path(), &projects, true).unwrap();
         assert_eq!(done.decoded_from_folder, 2);
         assert_eq!(label_of(&s, "m1"), "latina.web");
-        assert_eq!(label_of(&s, "g1"), "latina.web");
+        assert_eq!(
+            label_of(&s, "g1"),
+            "latina.web",
+            "sidechain chunks follow their session"
+        );
+        assert_eq!(
+            label_of(&s, "p1"),
+            "subagents",
+            "plan chunks are left alone"
+        );
         assert_eq!(label_of(&s, "x1"), "-Users-u-gone");
     }
 
