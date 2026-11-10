@@ -19,13 +19,17 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
 
 stop_daemon() {
+  # The PID launchd reports, not a pgrep pattern: any shell whose command line
+  # mentions the daemon would match a pattern.
+  local pid
+  pid=$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null | awk '$1 == "pid" {print $3; exit}')
   launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+  [[ -z "$pid" ]] && return 0
   for _ in {1..60}; do
-    pgrep -f "csr-engine daemon" >/dev/null || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
     sleep 0.5
   done
-  echo "daemon did not exit after bootout:" >&2
-  pgrep -fl "csr-engine daemon" >&2
+  echo "daemon pid $pid did not exit after bootout" >&2
   return 1
 }
 

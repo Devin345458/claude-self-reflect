@@ -182,10 +182,17 @@ impl Daemon {
             None => None,
         };
 
-        // Warm the embedding model off the request path: the first extraction
-        // tick and the first prompt-submit would otherwise pay for it.
-        {
-            let embeddings = self.embeddings.clone();
+        // Two embedding models. Each serializes its callers on one lock, and
+        // the watcher embeds transcript chunks from every active session
+        // almost continuously; with one model, every prompt-submit queued
+        // behind those batches (1 to 2 s on 2026-11-10). Background work
+        // (watcher, extraction, narrator, consolidation, plans) gets its own
+        // model; hooks and MCP queries keep `self.embeddings`.
+        let background_embeddings = Arc::new(EmbeddingEngine::new()?);
+
+        // Warm both off the request path: the first extraction tick and the
+        // first prompt-submit would otherwise pay for the load.
+        for embeddings in [self.embeddings.clone(), background_embeddings.clone()] {
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = embeddings.warm() {
                     tracing::warn!(error = %e, "embedding model warm-up failed");
@@ -221,7 +228,7 @@ impl Daemon {
         let watcher = crate::import::watcher::FileWatcher::new(
             self.projects_dir.clone(),
             self.storage.clone(),
-            self.embeddings.clone(),
+            background_embeddings.clone(),
             self.search.clone(),
         );
         let watcher_handle = watcher.spawn();
@@ -230,7 +237,7 @@ impl Daemon {
         // Start extraction loop (Layer 2 — always runs, free)
         let extraction_handle = {
             let storage = self.storage.clone();
-            let embeddings = self.embeddings.clone();
+            let embeddings = background_embeddings.clone();
             let search = self.search.clone();
             let interval = self.config.extraction_interval_secs;
             let shutdown = shutdown.clone();
@@ -243,7 +250,7 @@ impl Daemon {
         // Start narrator loop (Layer 3 — only if API key set)
         let narrator_handle = if let Some(client) = self.api_client {
             let storage = self.storage.clone();
-            let embeddings = self.embeddings.clone();
+            let embeddings = background_embeddings.clone();
             let search = self.search.clone();
             let config_batch_size = self.config.batch_size_trigger;
             let config_batch_time = self.config.batch_time_trigger_secs;
@@ -272,7 +279,7 @@ impl Daemon {
         // Start consolidation loop (Layer 4 — Dreamer v1, always runs, free)
         let consolidation_handle = {
             let storage = self.storage.clone();
-            let embeddings = self.embeddings.clone();
+            let embeddings = background_embeddings.clone();
             let search = self.search.clone();
             let shutdown = shutdown.clone();
             tokio::spawn(async move {
@@ -358,7 +365,7 @@ impl Daemon {
             // (same Arcs, so storage/index writes land in the shared instances).
             let engine = Arc::new(crate::engine::Engine::from_parts(
                 self.storage.clone(),
-                self.embeddings.clone(),
+                background_embeddings.clone(),
                 self.search.clone(),
                 self.projects_dir.clone(),
             ));
