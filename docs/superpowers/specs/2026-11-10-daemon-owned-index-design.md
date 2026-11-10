@@ -49,6 +49,15 @@ Anti-goals: a hook that blocks Claude Code; a failure that is silent to the user
 7. **Install path.** `setup` registers MCP over HTTP only. A local install script builds, signs,
    and swaps the binary with bootout and bootstrap.
 
+## Project labels (added 2026-11-10)
+
+The watcher labelled chunks by transcript folder name and only shortened names containing a
+lowercase `projects`; the hooks labelled by working directory. With hooks moved into the daemon
+only the raw form remained, and scoped search (which resolves the short form) missed it outside
+git repositories. Now every import path labels by the transcript's start directory, label-only
+changes skip re-embedding and the full-text trigger, and `relabel-projects` fixed 682,589 stored
+chunks (589,025 then 93,564 sidechain). About 151k chunks stay raw: their directories are gone.
+
 ## Known gaps
 
 - (Fixed 2026-11-10) MCP project scoping read the daemon's environment. Each session now

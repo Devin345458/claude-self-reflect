@@ -37,6 +37,12 @@ This is a hard fork; upstream compatibility is a non-goal.
   the client for its MCP roots (Claude Code returns the session's working
   directory) and scopes "current project" to it (`mcp/session.rs`). Env vars
   `MCP_CLIENT_CWD`/`CLAUDE_PROJECT_DIR` are only the fallback.
+- One project label per session: every import path labels chunks with the
+  project of the transcript's start directory (`import::project_label_for_transcript`),
+  the same rule the hooks and the MCP scope use. A label-only change updates
+  the row in place (no re-embed); `chunks_fts_au` fires only on content.
+  `csr-engine relabel-projects [--apply]` repairs stored labels (decodes the
+  folder when a transcript is gone). Run 2026-11-10: 682,589 chunks fixed.
 - Install: `scripts/install-local.sh` (build, back up, bootout, sign, swap,
   bootstrap, ping). `--rollback <backup dir>` reverses it.
 - Health: `csr-engine daemon-ping`. Design: `docs/superpowers/specs/2026-11-10-daemon-owned-index-design.md`.
